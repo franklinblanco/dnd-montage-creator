@@ -54,9 +54,16 @@ The knobs live in the `CONFIG` block at the top of `dnd_montage.py`:
 
 - `LOUDNESS_PERCENTILE` — higher = fewer, punchier highlights.
 - `PAD_BEFORE` / `PAD_AFTER` — lead-in / tail around each detected peak.
-- `NAME_TO_CLASS` — your `name → class` roster.
+- `END_ZONE_SEC` / `END_BOOST_DB` — clips come from a replay buffer, so the
+  payoff is near the end; this lowers the loudness bar in the final stretch.
+- `START_GUARD_SEC` / `START_GUARD_DB` — raises the bar early, so isolated
+  start-of-clip loudness has to be genuinely loud to count.
+- `NAME_OVERRIDES` — character names that don't embed their class (`name → class`).
 - `NAME_ROI` — the name-line box, as frame fractions; tune with `calibrate`.
-- `NAME_MATCH_CUTOFF` — min fuzzy-match score (0–1) to accept a roster name.
+- `NAME_MATCH_CUTOFF` — min fuzzy-match score (0–1) to accept a class.
+- `MARKET_CTX_SEC` — if the name never shows within this many seconds of a
+  highlight, it's treated as menu/market and skipped (clips with no name at all
+  are skipped entirely).
 
 MKV is handled, and `probe_duration` has fallbacks for non-finalized recordings
 (e.g. an OBS crash).
