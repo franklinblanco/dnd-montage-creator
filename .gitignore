@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Media in/out — keep these out of git
+clips/*
+output/*
+!clips/.gitkeep
+!output/.gitkeep
+
+# Generated class templates (image library; regenerate with addtemplate)
+templates/*.png
+
+# Scratch files the script writes to cwd
+_calib_frame.png
+_calib_crop.png
+_cls_frame.png
+_tpl_frame.png
+_concat_list.txt
