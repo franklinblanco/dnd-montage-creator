@@ -353,8 +353,18 @@ def fight_windows(path, duration):
         kw, _ = voice_near(ks, ke)
         windows.append([ks, ke, kw, True])
 
-    out = []
+    # merge any overlapping windows (adjacent kills can produce overlaps)
+    merged = []
     for s, e, w, k in sorted(windows):
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+            merged[-1][2] = max(merged[-1][2], w)
+            merged[-1][3] = merged[-1][3] or k
+        else:
+            merged.append([s, e, w, k])
+
+    out = []
+    for s, e, w, k in merged:
         if e - s < MIN_HL_SEC:
             continue
         if e - s > MAX_HL_SEC:
