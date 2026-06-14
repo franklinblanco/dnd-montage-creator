@@ -3,9 +3,11 @@
 dnd_montage.py — Dark and Darker montage helper
 
 Two jobs:
-  1) TIER 1  -> find the fights in each clip from your voice callouts. We
-                transcribe your commentary (Whisper) and cluster combat keywords
-                ("hit him", "one dead", ...) into whole-fight windows.
+  1) TIER 1  -> find the PvP fights. Boundaries come from the VISUAL in-combat
+                debuff (a red crossed-swords icon in the buff grid above your
+                card) detected per frame and merged into combat segments; VOICE
+                callouts (Whisper) then keep the segments that are real PvP
+                fights (vs PvE mobs) and rank them by kills.
   2) TIER 2  -> read which class you were playing from your character name
                 (shown above the health bar), via OCR.
 
@@ -44,9 +46,9 @@ WORKFLOW
          Add --stitch to also get output/_montage_all.mp4
 
 Tuning: everything you'll want to touch lives in the CONFIG block below. The
-knobs that matter most are the KILL_WORDS / ENGAGE_WORDS keyword lists (match
-how you talk), CLUSTER_GAP (how far apart callouts can be and still count as one
-fight), and PAD_BEFORE / PAD_AFTER (lead-in / tail around each fight).
+knobs that matter most are COMBAT_RED_MIN / COMBAT_MERGE_GAP (visual combat
+boundaries), the KILL_WORDS / ENGAGE_WORDS lists and PVP_MIN_WEIGHT (which
+combat counts as a PvP fight), and PAD_BEFORE / PAD_AFTER (lead-in / tail).
 """
 
 import argparse
@@ -56,6 +58,8 @@ import json
 import subprocess
 import sys
 import glob
+import shutil
+import tempfile
 import difflib
 
 import numpy as np
@@ -66,33 +70,42 @@ import pytesseract
 # CONFIG — tune these
 # ======================================================================
 
-# --- Highlight detection via voice callouts (Tier 1) ---
-# We transcribe your commentary with Whisper and find fights by where your
-# combat callouts cluster — a fight is the whole span from your first callout to
-# your last, which keeps the moment intact through quiet stretches (loudness
-# can't do that). Keywords match as case-insensitive substrings, so "dead"
-# catches "he's dead", "one dead", "ranger dead", etc. Weights say how strongly
-# a phrase implies a real fight; kills weigh most.
-WHISPER_MODEL     = "small.en"  # faster-whisper model: tiny/base/small/medium .en
+# --- Fight detection: visual combat boundaries ∩ voice significance (Tier 1) ---
+# Boundaries come from the VISUAL "in-combat" debuff (a red crossed-swords icon
+# in the fixed buff grid above the player's card, bottom-left). It fires on every
+# damage instance and fades, so we detect it as red-pixel density per frame and
+# merge contiguous combat into one segment — true fight boundaries that survive
+# quiet stretches and merge chained fights / 3rd-parties.
+COMBAT_ROI        = (0.004, 0.798, 0.078, 0.858)  # buff grid above MY card
+COMBAT_RED_MIN    = 20    # saturated-red px in the ROI to call a frame "in combat"
+COMBAT_FPS        = 2.0   # frames/sec sampled for the combat scan
+COMBAT_MERGE_GAP  = 8.0   # bridge combat gaps up to this many sec (one fight)
+COMBAT_MIN_SEC    = 4.0   # ignore combat blips shorter than this (stray mob hit)
 
-# Kills / downs — the payoff. ("dead" covers "he's dead", "one dead", "X dead".)
+# The red X also fires on PvE mobs, so VOICE decides which combat is a real PvP
+# fight worth keeping, and ranks it. Keywords match as case-insensitive
+# substrings ("dead" covers "he's dead", "one dead", "ranger dead").
+WHISPER_MODEL     = "small.en"  # faster-whisper model: tiny/base/small/medium .en
 KILL_WORDS   = ["dead", "got him", "got one", "killed"]
-# Engaging / in a fight.
 ENGAGE_WORDS = ["hit him", "hit", "shooting", "shoot", "push", "running", "run",
                 "players", "people", "trail", "behind", "coming", "reset"]
-# Scouting — sizing up an enemy by gear/class. Soft signal (also said off-fight).
 SCOUT_WORDS  = ["geared", "kitted", "naked", "ranger", "rogue", "fighter",
                 "wizard", "sorcerer", "druid", "barbarian", "bard", "cleric",
                 "warlock"]
 KILL_W, ENGAGE_W, SCOUT_W = 3.0, 1.0, 0.3   # per-keyword weights
 
-CLUSTER_GAP        = 12.0  # callouts within this many sec belong to one fight
-MIN_CLUSTER_WEIGHT = 2.0   # a fight must score at least this (any kill always
-                           #   qualifies, regardless of weight)
-PAD_BEFORE         = 4.0   # lead-in before a fight's first callout
-PAD_AFTER          = 6.0   # tail after its last callout (keeps the kill/aftermath)
-MIN_HL_SEC         = 3.0   # drop fight windows shorter than this
-MAX_HL_SEC         = 75.0  # hard cap on a single fight window
+# Voice anchors WHERE the PvP fights are (PvE combat is near-continuous, so the
+# red X can't separate fights on its own). The combat segments then confirm a
+# real fight and let the window extend to the fight's true combat edges.
+VOICE_CLUSTER_GAP = 20.0  # group PvP callouts within this many sec into one fight
+PVP_MIN_WEIGHT    = 2.0   # min voice weight to keep a cluster (any kill keeps it)
+VOICE_MARGIN      = 8.0   # a cluster must coincide with combat within this margin
+FIGHT_EXTEND      = 15.0  # extend a window this far into adjacent combat, before
+                          #   PAD — captures the fight's start/finish you didn't narrate
+PAD_BEFORE        = 4.0   # min lead-in before a fight
+PAD_AFTER         = 6.0   # min tail after a fight (keeps the kill/aftermath)
+MIN_HL_SEC        = 4.0   # drop fight windows shorter than this
+MAX_HL_SEC        = 90.0  # hard cap on a single fight window
 
 # --- Class detection via player-name OCR (Tier 2) ---
 # Your character name is drawn above the health bar (bottom-center). We OCR it
@@ -238,35 +251,79 @@ def score_text(text):
             weight += SCOUT_W
     return weight, kill
 
-def fight_windows(segments, duration):
-    """Cluster scored callouts into whole-fight windows. Returns a time-ordered
-    list of (start, end, weight, has_kill)."""
-    events = []
-    for s, e, text in segments:
-        w, kill = score_text(text)
-        if w > 0:
-            events.append((s, e, w, kill))
-    if not events:
-        return []
+def combat_red_px(frame):
+    """Saturated-red pixels in the buff grid above the player's card. The combat
+    debuff is the only red icon there (other buffs are white/gold/blue)."""
+    roi = crop_roi(frame, COMBAT_ROI)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    m1 = cv2.inRange(hsv, (0, 110, 70), (12, 255, 255))
+    m2 = cv2.inRange(hsv, (168, 110, 70), (180, 255, 255))
+    return int(((m1 | m2) > 0).sum())
 
-    # group callouts that are close in time into one fight
+def combat_segments(path, duration):
+    """Scan the clip for the in-combat debuff and return merged combat spans
+    [(start, end)] — these are ALL combat (PvP and PvE)."""
+    tmpdir = tempfile.mkdtemp(prefix="dndcombat_")
+    try:
+        run_quiet(["ffmpeg", "-i", path, "-vf", f"fps={COMBAT_FPS}", "-q:v", "3",
+                   os.path.join(tmpdir, "f_%05d.jpg"), "-v", "quiet"])
+        hits = []
+        for i, fp in enumerate(sorted(glob.glob(os.path.join(tmpdir, "f_*.jpg")))):
+            frame = cv2.imread(fp)
+            if frame is not None and combat_red_px(frame) >= COMBAT_RED_MIN:
+                hits.append(i / COMBAT_FPS)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    segs = []
+    for t in hits:
+        if segs and t - segs[-1][1] <= COMBAT_MERGE_GAP:
+            segs[-1][1] = t
+        else:
+            segs.append([t, t])
+    return [(s, e) for s, e in segs if e - s >= COMBAT_MIN_SEC]
+
+def voice_pvp_clusters(path):
+    """Group PvP voice callouts into fight cores: time-ordered clusters of
+    (start, end, weight, has_kill)."""
+    voice = [(s, e, *score_text(text)) for s, e, text in transcribe(path)]
+    voice = [(s, e, w, k) for s, e, w, k in voice if w > 0]
     clusters = []
-    for s, e, w, kill in events:
-        if clusters and s - clusters[-1]["end"] <= CLUSTER_GAP:
+    for s, e, w, k in voice:
+        if clusters and s - clusters[-1]["end"] <= VOICE_CLUSTER_GAP:
             c = clusters[-1]
             c["end"] = max(c["end"], e)
             c["weight"] += w
-            c["kill"] = c["kill"] or kill
+            c["kill"] = c["kill"] or k
         else:
-            clusters.append({"start": s, "end": e, "weight": w, "kill": kill})
+            clusters.append({"start": s, "end": e, "weight": w, "kill": k})
+    return clusters
+
+def fight_windows(path, duration):
+    """Voice anchors the fight, the combat segment confirms it and bounds the
+    window's extension. Returns time-ordered (start, end, weight, has_kill)."""
+    segs = combat_segments(path, duration)
+    clusters = voice_pvp_clusters(path)
+
+    def combat_for(s, e):
+        for cs, ce in segs:
+            if cs - VOICE_MARGIN <= e and ce + VOICE_MARGIN >= s:
+                return (cs, ce)
+        return None
 
     out = []
     for c in clusters:
-        # a lone stray callout isn't a fight — but any kill always qualifies
-        if not c["kill"] and c["weight"] < MIN_CLUSTER_WEIGHT:
+        if not c["kill"] and c["weight"] < PVP_MIN_WEIGHT:
             continue
-        s = max(0.0, c["start"] - PAD_BEFORE)
-        e = min(duration, c["end"] + PAD_AFTER)
+        seg = combat_for(c["start"], c["end"])
+        if seg is None:        # narration with no actual combat -> not a fight
+            continue
+        cs, ce = seg
+        # extend toward the fight's real edges, bounded by the combat segment
+        s = max(cs, c["start"] - FIGHT_EXTEND) - PAD_BEFORE
+        e = min(ce, c["end"] + FIGHT_EXTEND) + PAD_AFTER
+        s = max(0.0, s)
+        e = min(duration, e)
         if e - s < MIN_HL_SEC:
             continue
         if e - s > MAX_HL_SEC:
@@ -441,24 +498,29 @@ def mode_readname(args):
         print(f"Verdict: class={cls} (conf {score:.2f})")
 
 def mode_callouts(args):
-    """Diagnostic: show the transcript with keyword scores and the fight windows
-    they produce — use this to tune the keyword lists."""
+    """Diagnostic: show visual combat segments, the voice callouts near them,
+    and the fused fight windows — use this to tune detection."""
     dur = probe_duration(args.clip)
-    segments = transcribe(args.clip)
-    print(f"duration {dur:.0f}s — transcript (score / KILL flag):\n")
-    for s, e, text in segments:
+    segs = combat_segments(args.clip, dur)
+    print(f"duration {dur:.0f}s\n\nVisual combat segments (red-X debuff):")
+    if not segs:
+        print("  (none)")
+    for cs, ce in segs:
+        print(f"  [{cs:6.1f}-{ce:6.1f}]  ({ce-cs:.0f}s)")
+
+    print("\nVoice callouts:")
+    for s, e, text in transcribe(args.clip):
         w, kill = score_text(text)
         if w > 0:
             print(f"  [{s:6.1f}-{e:6.1f}] ({w:.1f}{' KILL' if kill else ''}) {text}")
-        else:
-            print(f"  [{s:6.1f}-{e:6.1f}]        {text}")
-    print("\nFight windows:")
-    fights = fight_windows(segments, dur)
+
+    print("\nFused fight windows:")
+    fights = fight_windows(args.clip, dur)
     if not fights:
         print("  (none)")
     for i, (s, e, w, kill) in enumerate(fights, 1):
         tag = " KILL" if kill else ""
-        print(f"  hl{i:02d}  [{s:.1f}s - {e:.1f}s]  score {w:.1f}{tag}")
+        print(f"  hl{i:02d}  [{s:.1f}s - {e:.1f}s]  PvP-score {w:.1f}{tag}")
 
 def mode_run(args):
     os.makedirs(args.out, exist_ok=True)
@@ -487,7 +549,7 @@ def mode_run(args):
             continue
 
         hit_times = name_hit_times(scan)
-        fights = fight_windows(transcribe(clip), dur)
+        fights = fight_windows(clip, dur)
         kept = [(s, e, w, k) for s, e, w, k in fights
                 if is_gameplay(hit_times, s, e)]
         skipped = len(fights) - len(kept)
