@@ -17,7 +17,8 @@ SETUP (once)
   - Install FFmpeg + Tesseract and put `ffmpeg`/`ffprobe`/`tesseract` on PATH.
       macOS:  brew install ffmpeg tesseract
   - pip install -r requirements.txt   (numpy, opencv-python, pytesseract)
-  - Fill in NAME_TO_CLASS below: map each of YOUR character names to its class.
+  - Class is read from your character name (names embed their class). Only add
+    a line to NAME_OVERRIDES below for a character whose name does NOT.
 
 ----------------------------------------------------------------------
 WORKFLOW
@@ -65,32 +66,48 @@ WIN_SEC           = 0.40   # length of each loudness measurement window
 HOP_SEC           = 0.10   # how far the window slides each step
 SMOOTH_SEC        = 0.50   # moving-average smoothing over the loudness curve
 
-LOUDNESS_PERCENTILE = 90.0 # a moment counts as "action" if louder than this %
+LOUDNESS_PERCENTILE = 95.0 # a moment counts as "action" if louder than this %
                            #   of the clip. Higher = fewer, punchier highlights.
 ABS_FLOOR_DB      = -40.0  # never flag anything quieter than this (kills silence)
 
 PAD_BEFORE        = 3.0    # seconds of lead-in before a detected peak
 PAD_AFTER         = 5.0    # seconds of tail after it
-MERGE_GAP         = 4.0    # merge two highlights if they're within this many sec
+MERGE_GAP         = 6.0    # merge two highlights if they're within this many sec
 MIN_HL_SEC        = 2.0    # drop highlights shorter than this
 MAX_HL_SEC        = 30.0   # hard cap on a single highlight's length
 
+# End-bias: clips come from a replay buffer, so the payoff is almost always
+# near the END (you clip after a fight / while looting). Favor the tail, and
+# treat the very start skeptically so early ambient loudness doesn't crowd in.
+# (Action at the start usually means a double-clip or a long fight — still
+# caught, but it has to be genuinely loud to clear the raised bar.)
+END_ZONE_SEC      = 90.0   # the final this-many seconds are the "payoff zone"
+END_BOOST_DB      = 4.0    # lower the loudness bar by this much in the end zone
+START_GUARD_SEC   = 30.0   # the first this-many seconds are treated skeptically
+START_GUARD_DB    = 5.0    # raise the loudness bar by this much in the start guard
+
 # --- Class detection via player-name OCR (Tier 2) ---
-# Your character name is drawn above the health bar (bottom-center). We OCR it,
-# fuzzy-match against the roster below, and majority-vote across sampled frames.
-# Map each of YOUR character names to its class (matching is case-insensitive
-# and tolerant of OCR garbling). Add one line per character. Clips whose name
-# matches nothing here are labeled "unknown".
-NAME_TO_CLASS = {
-    "FoklinMageTTVRANGER": "ranger",
-    # "YourRogueName": "rogue",
-    # "YourFighterName": "fighter",
+# Your character name is drawn above the health bar (bottom-center). We OCR it
+# and read the class straight from the name: your character names embed their
+# class (e.g. a name ending in "RANGER" -> ranger), so we fuzzy-match the class
+# names below against the OCR'd text and majority-vote across sampled frames.
+CLASSES = ["fighter", "ranger", "rogue", "wizard", "sorcerer",
+           "druid", "barbarian", "bard", "cleric", "warlock"]
+
+# Exceptions: character names that DON'T embed their class. Map name -> class.
+NAME_OVERRIDES = {
+    "FinallyBalanced": "druid",
 }
 
 # ROI of the name line as frame fractions (x0, y0, x1, y1). Tune with `calibrate`.
 NAME_ROI          = (0.43, 0.892, 0.59, 0.932)
-NAME_SAMPLES      = 10     # frames sampled across the clip, then majority-vote
-NAME_MATCH_CUTOFF = 0.62   # min fuzzy-match ratio (0-1) to accept a roster name
+NAME_SCAN_STEP    = 3.0    # seconds between name-OCR samples across the clip
+NAME_MATCH_CUTOFF = 0.72   # min fuzzy-match ratio (0-1) to accept a class
+
+# Menu/market gate: a clip (or a stretch of it) with no character name on screen
+# isn't gameplay and isn't worth clipping. If the name never shows near a
+# highlight, we skip it; if it never shows at all, we skip the whole clip.
+MARKET_CTX_SEC    = 30.0   # look this far around a highlight for the name
 
 # --- Output encoding ---
 # Re-encoding gives frame-accurate cuts (stream-copy only cuts on keyframes).
@@ -196,8 +213,17 @@ def find_highlights(path):
     if len(db) == 0:
         return []
 
-    thresh = max(np.percentile(db, LOUDNESS_PERCENTILE), ABS_FLOOR_DB)
-    mask = db >= thresh
+    clip_dur = times[-1] + WIN_SEC
+
+    # Position-dependent loudness bar: a single percentile gives one global
+    # threshold; we nudge it by clip position so the replay-buffer payoff (near
+    # the end) is easy to clear, while the start has to be genuinely loud.
+    base = max(np.percentile(db, LOUDNESS_PERCENTILE), ABS_FLOOR_DB)
+    thr = np.full_like(db, base)
+    thr[times >= clip_dur - END_ZONE_SEC] -= END_BOOST_DB
+    thr[times <= START_GUARD_SEC]         += START_GUARD_DB
+    thr = np.maximum(thr, ABS_FLOOR_DB)
+    mask = db >= thr
 
     # contiguous runs of "loud" -> raw segments
     segs = []
@@ -212,9 +238,8 @@ def find_highlights(path):
         else:
             i += 1
 
-    duration = times[-1] + WIN_SEC
     # pad, clamp
-    segs = [[max(0.0, s - PAD_BEFORE), min(duration, e + PAD_AFTER)]
+    segs = [[max(0.0, s - PAD_BEFORE), min(clip_dur, e + PAD_AFTER)]
             for s, e in segs]
 
     # merge ones that are close together
@@ -233,6 +258,16 @@ def find_highlights(path):
         if e - s > MAX_HL_SEC:
             e = s + MAX_HL_SEC
         out.append((round(s, 3), round(e, 3)))
+
+    # Safety net: if nothing cleared the bar, keep the single loudest moment so
+    # a clip with real action never silently yields zero highlights.
+    if not out:
+        peak = int(np.argmax(db))
+        s = max(0.0, times[peak] - PAD_BEFORE)
+        e = min(clip_dur, times[peak] + PAD_AFTER)
+        if e - s >= MIN_HL_SEC:
+            out = [(round(s, 3), round(e, 3))]
+
     return out
 
 # ======================================================================
@@ -264,54 +299,72 @@ def ocr_name(crop):
 def _norm(s):
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
-def match_roster(text):
-    """Best (class, score) for a roster name aligned anywhere in OCR `text`.
-    Slides each known name across the (normalized) text so leading/trailing
-    OCR junk doesn't sink the score."""
+def _best_align(needle, hay):
+    """Best SequenceMatcher ratio of `needle` aligned anywhere in `hay`, so
+    leading/trailing OCR junk around the bit we care about doesn't sink it."""
+    if not needle or not hay:
+        return 0.0
+    if len(hay) <= len(needle):
+        return difflib.SequenceMatcher(None, needle, hay).ratio()
+    return max(
+        difflib.SequenceMatcher(None, needle, hay[i:i + len(needle)]).ratio()
+        for i in range(0, len(hay) - len(needle) + 1)
+    )
+
+def match_class(text):
+    """Return (class, score) for OCR'd name `text`. Check name overrides first
+    (their names don't embed the class), then look for an embedded class name."""
     t = _norm(text)
     if not t:
         return None, 0.0
     best_cls, best_score = None, 0.0
-    for name, cls in NAME_TO_CLASS.items():
-        n = _norm(name)
-        if not n:
-            continue
-        if len(t) <= len(n):
-            score = difflib.SequenceMatcher(None, n, t).ratio()
-        else:
-            score = max(
-                difflib.SequenceMatcher(None, n, t[i:i + len(n)]).ratio()
-                for i in range(0, len(t) - len(n) + 1)
-            )
+    for name, cls in NAME_OVERRIDES.items():
+        score = _best_align(_norm(name), t)
+        if score > best_score:
+            best_cls, best_score = cls, score
+    for cls in CLASSES:
+        score = _best_align(cls, t)
         if score > best_score:
             best_cls, best_score = cls, score
     return best_cls, best_score
 
-def detect_class(path, duration):
-    """Sample frames, OCR the name line, fuzzy-match to the roster, vote."""
-    if not NAME_TO_CLASS:
-        return "unknown", 0.0
-
-    ts = np.linspace(0.06 * duration, 0.94 * duration, NAME_SAMPLES)
-    votes, best_overall = {}, 0.0
-    tmp = "_cls_frame.png"
-
-    for t in ts:
+def scan_names(path, duration):
+    """One pass over the clip: OCR the name line every NAME_SCAN_STEP seconds.
+    Returns a list of (t, class, score) — reused for both class voting and the
+    menu/market gate, so we only decode frames once."""
+    scan = []
+    tmp = "_scan_frame.png"
+    for t in np.arange(NAME_SCAN_STEP, duration, NAME_SCAN_STEP):
         grab_frame(path, float(t), tmp)
         frame = cv2.imread(tmp)
         if frame is None:
             continue
-        cls, score = match_roster(ocr_name(crop_roi(frame, NAME_ROI)))
-        if cls and score >= NAME_MATCH_CUTOFF:
-            votes[cls] = votes.get(cls, 0) + 1
-            best_overall = max(best_overall, score)
-
+        cls, score = match_class(ocr_name(crop_roi(frame, NAME_ROI)))
+        scan.append((float(t), cls, score))
     if os.path.exists(tmp):
         os.remove(tmp)
+    return scan
 
+def vote_class(scan):
+    """Majority-vote the class over the frames where the name read clearly."""
+    votes, best = {}, 0.0
+    for _, cls, score in scan:
+        if cls and score >= NAME_MATCH_CUTOFF:
+            votes[cls] = votes.get(cls, 0) + 1
+            best = max(best, score)
     if not votes:
         return "unknown", 0.0
-    return max(votes, key=votes.get), best_overall
+    return max(votes, key=votes.get), best
+
+def name_hit_times(scan):
+    """Times where the character name read clearly (= we were in gameplay)."""
+    return [t for t, cls, score in scan if cls and score >= NAME_MATCH_CUTOFF]
+
+def is_gameplay(hit_times, s, e):
+    """A highlight is gameplay if the name shows anywhere within MARKET_CTX_SEC
+    of it. Name reads are sparse, so we look at a window, not single frames; a
+    contiguous no-name stretch (menu/market, or post-death) won't qualify."""
+    return any(s - MARKET_CTX_SEC <= t <= e + MARKET_CTX_SEC for t in hit_times)
 
 # ======================================================================
 # Cutting
@@ -358,30 +411,33 @@ def mode_calibrate(args):
     print("If it's off, edit NAME_ROI and run calibrate again.")
 
 def mode_readname(args):
-    if not NAME_TO_CLASS:
-        print("NAME_TO_CLASS is empty — add your character(s) first.\n")
     dur = probe_duration(args.clip)
-    ts = np.linspace(0.06 * dur, 0.94 * dur, NAME_SAMPLES)
     tmp = "_read_frame.png"
-    for t in ts:
+    scan = []
+    for t in np.arange(NAME_SCAN_STEP, dur, NAME_SCAN_STEP):
         grab_frame(args.clip, float(t), tmp)
         frame = cv2.imread(tmp)
         if frame is None:
-            print(f"  t={t:>5.0f}s  (no frame)")
             continue
         raw = ocr_name(crop_roi(frame, NAME_ROI))
-        cls, score = match_roster(raw)
-        print(f"  t={t:>5.0f}s  ocr='{raw}'  -> {cls or '-'} ({score:.2f})")
+        cls, score = match_class(raw)
+        ok = bool(cls) and score >= NAME_MATCH_CUTOFF
+        scan.append((t, cls, score))
+        print(f"  t={t:>5.0f}s {'#' if ok else ' '} ocr='{raw}'"
+              f"  -> {cls or '-'} ({score:.2f})")
     if os.path.exists(tmp):
         os.remove(tmp)
-    cls, score = detect_class(args.clip, dur)
-    print(f"\nVerdict: class={cls} (conf {score:.2f})")
+
+    hits = len(name_hit_times(scan))
+    cls, score = vote_class(scan)
+    print(f"\nName visible on {hits}/{len(scan)} sampled frame(s).")
+    if cls == "unknown":
+        print("Verdict: no name found — this clip would be treated as menu/market.")
+    else:
+        print(f"Verdict: class={cls} (conf {score:.2f})")
 
 def mode_run(args):
     os.makedirs(args.out, exist_ok=True)
-    if not NAME_TO_CLASS:
-        print("WARNING: NAME_TO_CLASS is empty — clips will be labeled 'unknown'.\n"
-              "         Add your character name(s) to the map in CONFIG.\n")
 
     clips = []
     for ext in ("mp4", "mkv", "mov", "MP4", "MKV", "MOV"):
@@ -399,12 +455,23 @@ def mode_run(args):
             print(f"  ! skipping {base}: {e}")
             continue
 
-        cls, score = detect_class(clip, dur)
-        hls = find_highlights(clip)
-        print(f"{base}: class={cls} (conf {score:.2f}), "
-              f"{len(hls)} highlight(s)")
+        scan = scan_names(clip, dur)
+        cls, score = vote_class(scan)
+        if cls == "unknown":
+            print(f"{base}: no character name on screen — assuming menu/market, "
+                  f"skipping.")
+            continue
 
-        for idx, (s, e) in enumerate(hls, 1):
+        hit_times = name_hit_times(scan)
+        hls = find_highlights(clip)
+        kept = [(s, e) for s, e in hls if is_gameplay(hit_times, s, e)]
+        skipped = len(hls) - len(kept)
+        msg = f"{base}: class={cls} (conf {score:.2f}), {len(kept)} highlight(s)"
+        if skipped:
+            msg += f", {skipped} skipped (menu/market)"
+        print(msg)
+
+        for idx, (s, e) in enumerate(kept, 1):
             out_name = f"{cls}__{base}__hl{idx:02d}.mp4"
             out_path = os.path.join(args.out, out_name)
             cut(clip, s, e, out_path)
