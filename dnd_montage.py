@@ -87,21 +87,23 @@ COMBAT_MIN_SEC    = 4.0   # ignore combat blips shorter than this (stray mob hit
 # substrings ("dead" covers "he's dead", "one dead", "ranger dead").
 WHISPER_MODEL     = "small.en"  # faster-whisper model: tiny/base/small/medium .en
 KILL_WORDS   = ["dead", "got him", "got one", "killed"]
-ENGAGE_WORDS = ["hit him", "hit", "shooting", "shoot", "push", "running", "run",
+# (no "running"/"run" — they matched casual speech like "running in circles")
+ENGAGE_WORDS = ["hit him", "hit", "shooting", "shoot", "push",
                 "players", "people", "trail", "behind", "coming", "reset"]
 SCOUT_WORDS  = ["geared", "kitted", "naked", "ranger", "rogue", "fighter",
                 "wizard", "sorcerer", "druid", "barbarian", "bard", "cleric",
                 "warlock"]
 KILL_W, ENGAGE_W, SCOUT_W = 3.0, 1.0, 0.3   # per-keyword weights
 
-# Voice anchors WHERE the PvP fights are (PvE combat is near-continuous, so the
-# red X can't separate fights on its own). The combat segments then confirm a
-# real fight and let the window extend to the fight's true combat edges.
-VOICE_CLUSTER_GAP = 20.0  # group PvP callouts within this many sec into one fight
-PVP_MIN_WEIGHT    = 2.0   # min voice weight to keep a cluster (any kill keeps it)
-VOICE_MARGIN      = 8.0   # a cluster must coincide with combat within this margin
-FIGHT_EXTEND      = 15.0  # extend a window this far into adjacent combat, before
-                          #   PAD — captures the fight's start/finish you didn't narrate
+# Path A — exploit the structure: you clip via replay buffer right after a PvP
+# fight, so every clip has a payoff fight near the END. We always emit that
+# "closing fight" (last combat window near the clip end — no voice needed, so
+# it survives un-narrated fights), plus any earlier NARRATED KILL as its own
+# fight. PvE-vs-PvP is sidestepped: we already know the clip contains a fight.
+CLOSING_FIGHT_SEC = 50.0  # length of the closing-fight window (back from the end)
+VOICE_CLUSTER_GAP = 20.0  # group voice callouts within this many sec into a fight
+VOICE_MARGIN      = 8.0   # a kill-cluster must coincide with combat within this
+FIGHT_EXTEND      = 15.0  # extend a kill window this far into adjacent combat
 PAD_BEFORE        = 4.0   # min lead-in before a fight
 PAD_AFTER         = 6.0   # min tail after a fight (keeps the kill/aftermath)
 MIN_HL_SEC        = 4.0   # drop fight windows shorter than this
@@ -300,35 +302,50 @@ def voice_pvp_clusters(path):
     return clusters
 
 def fight_windows(path, duration):
-    """Voice anchors the fight, the combat segment confirms it and bounds the
-    window's extension. Returns time-ordered (start, end, weight, has_kill)."""
+    """Path A. Always emit the closing fight (last combat near the clip end),
+    plus any earlier narrated kill as its own window. Returns time-ordered
+    (start, end, weight, has_kill)."""
     segs = combat_segments(path, duration)
+    if not segs:
+        return []                      # no combat at all -> menu/market clip
     clusters = voice_pvp_clusters(path)
 
-    def combat_for(s, e):
-        for cs, ce in segs:
-            if cs - VOICE_MARGIN <= e and ce + VOICE_MARGIN >= s:
-                return (cs, ce)
-        return None
+    def voice_near(s, e):
+        w = sum(c["weight"] for c in clusters if c["start"] <= e and c["end"] >= s)
+        k = any(c["kill"] for c in clusters if c["start"] <= e and c["end"] >= s)
+        return round(w, 1), k
+
+    windows = []
+    # (1) the closing fight — the payoff, anchored at the last combat
+    cs0, ce0 = segs[-1]
+    e = min(duration, ce0 + PAD_AFTER)
+    s = max(0.0, max(cs0, ce0 - CLOSING_FIGHT_SEC) - PAD_BEFORE)
+    w, k = voice_near(s, e)
+    windows.append([s, e, w, k])
+
+    # (2) earlier narrated kills (separate PvP fights worth keeping)
+    for c in clusters:
+        if not c["kill"]:
+            continue
+        seg = next(((a, b) for a, b in segs if a - VOICE_MARGIN <= c["end"]
+                    and b + VOICE_MARGIN >= c["start"]), None)
+        if seg is None:
+            continue
+        a, b = seg
+        ks = max(0.0, max(a, c["start"] - FIGHT_EXTEND) - PAD_BEFORE)
+        ke = min(duration, min(b, c["end"] + FIGHT_EXTEND) + PAD_AFTER)
+        if ke > windows[0][0] and ks < windows[0][1]:
+            continue               # overlaps the closing fight — already covered
+        kw, _ = voice_near(ks, ke)
+        windows.append([ks, ke, kw, True])
 
     out = []
-    for c in clusters:
-        if not c["kill"] and c["weight"] < PVP_MIN_WEIGHT:
-            continue
-        seg = combat_for(c["start"], c["end"])
-        if seg is None:        # narration with no actual combat -> not a fight
-            continue
-        cs, ce = seg
-        # extend toward the fight's real edges, bounded by the combat segment
-        s = max(cs, c["start"] - FIGHT_EXTEND) - PAD_BEFORE
-        e = min(ce, c["end"] + FIGHT_EXTEND) + PAD_AFTER
-        s = max(0.0, s)
-        e = min(duration, e)
+    for s, e, w, k in sorted(windows):
         if e - s < MIN_HL_SEC:
             continue
         if e - s > MAX_HL_SEC:
-            e = s + MAX_HL_SEC
-        out.append((round(s, 3), round(e, 3), round(c["weight"], 1), c["kill"]))
+            s = e - MAX_HL_SEC     # keep the end (the payoff), trim the front
+        out.append((round(s, 3), round(e, 3), w, k))
     return out
 
 # ======================================================================
