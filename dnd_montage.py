@@ -4,7 +4,8 @@ dnd_montage.py — Dark and Darker montage helper
 
 Two jobs:
   1) TIER 1  -> find the loud/action moments in each clip (audio loudness).
-  2) TIER 2  -> read which class you were playing from the bottom-left icon.
+  2) TIER 2  -> read which class you were playing from your character name
+                (shown above the health bar), via OCR + a name->class map.
 
 It does NOT auto-stitch by default. It cuts each highlight into its own file,
 named with the detected class, so you can drag them into DaVinci Resolve and
@@ -13,27 +14,28 @@ arrange them yourself. (Pass --stitch to also get one concatenated file.)
 ----------------------------------------------------------------------
 SETUP (once)
 ----------------------------------------------------------------------
-  - Install FFmpeg and make sure `ffmpeg` and `ffprobe` are on your PATH.
-  - pip install numpy opencv-python
+  - Install FFmpeg + Tesseract and put `ffmpeg`/`ffprobe`/`tesseract` on PATH.
+      macOS:  brew install ffmpeg tesseract
+  - pip install -r requirements.txt   (numpy, opencv-python, pytesseract)
+  - Fill in NAME_TO_CLASS below: map each of YOUR character names to its class.
 
 ----------------------------------------------------------------------
 WORKFLOW
 ----------------------------------------------------------------------
-  Step 1 — find where the class icon sits on screen (do this once):
-      python dnd_montage.py calibrate "clips/some_clip.mp4"
-      -> writes _calib_frame.png (full frame with a red ROI box drawn)
-         and _calib_crop.png (just what's inside the box).
-         Open _calib_frame.png, check the red box sits over the class icon.
-         If not, tweak ICON_ROI below and run calibrate again.
+  Step 1 — check the name box lands on your character name (do this once):
+      python dnd_montage.py calibrate "clips/some_clip.mkv"
+      -> writes _calib_frame.png (full frame with a red NAME_ROI box drawn),
+         _calib_crop.png (what's inside the box), and _calib_ocr.png (what
+         OCR actually sees). The red box should sit over the name above your
+         health bar. If it's off, tweak NAME_ROI below and run again.
 
-  Step 2 — build your icon library (once per class you play):
-      python dnd_montage.py addtemplate "clips/a_ranger_clip.mp4" --name ranger
-      python dnd_montage.py addtemplate "clips/a_rogue_clip.mp4"  --name rogue
-      ... repeat for each class. Saves templates/<name>.png
+  Step 2 — sanity-check the read on a clip (optional):
+      python dnd_montage.py readname "clips/some_clip.mkv"
+      -> prints the raw OCR per sampled frame and the class it matched.
 
   Step 3 — process a whole folder:
       python dnd_montage.py run --in clips --out output
-      -> output/ranger__a_ranger_clip__hl01.mp4, etc.
+      -> output/ranger__some_clip__hl01.mp4, etc.
          Add --stitch to also get output/_montage_all.mp4
 
 Tuning: everything you'll want to touch lives in the CONFIG block below.
@@ -43,12 +45,15 @@ and PAD_BEFORE / PAD_AFTER (how much lead-in / tail each highlight gets).
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import glob
+import difflib
 
 import numpy as np
 import cv2
+import pytesseract
 
 # ======================================================================
 # CONFIG — tune these
@@ -70,13 +75,22 @@ MERGE_GAP         = 4.0    # merge two highlights if they're within this many se
 MIN_HL_SEC        = 2.0    # drop highlights shorter than this
 MAX_HL_SEC        = 30.0   # hard cap on a single highlight's length
 
-# --- Class icon detection (Tier 2) ---
-# ROI given as fractions of the frame (x0, y0, x1, y1), origin top-left.
-# Default: a box in the bottom-left corner. Tune with `calibrate`.
-ICON_ROI          = (0.010, 0.880, 0.090, 0.985)
-ICON_SAMPLES      = 3      # how many frames to sample per clip, then majority-vote
-MATCH_THRESHOLD   = 0.60   # min normalized-correlation score to accept a class
-SEARCH_PAD_PX     = 12     # let the icon wiggle this many px when matching
+# --- Class detection via player-name OCR (Tier 2) ---
+# Your character name is drawn above the health bar (bottom-center). We OCR it,
+# fuzzy-match against the roster below, and majority-vote across sampled frames.
+# Map each of YOUR character names to its class (matching is case-insensitive
+# and tolerant of OCR garbling). Add one line per character. Clips whose name
+# matches nothing here are labeled "unknown".
+NAME_TO_CLASS = {
+    "FoklinMageTTVRANGER": "ranger",
+    # "YourRogueName": "rogue",
+    # "YourFighterName": "fighter",
+}
+
+# ROI of the name line as frame fractions (x0, y0, x1, y1). Tune with `calibrate`.
+NAME_ROI          = (0.43, 0.892, 0.59, 0.932)
+NAME_SAMPLES      = 10     # frames sampled across the clip, then majority-vote
+NAME_MATCH_CUTOFF = 0.62   # min fuzzy-match ratio (0-1) to accept a roster name
 
 # --- Output encoding ---
 # Re-encoding gives frame-accurate cuts (stream-copy only cuts on keyframes).
@@ -84,8 +98,6 @@ VIDEO_CODEC       = "libx264"
 CRF               = "18"
 PRESET            = "veryfast"
 AUDIO_CODEC       = "aac"
-
-TEMPLATE_DIR      = "templates"
 
 # ======================================================================
 # ffmpeg / ffprobe helpers
@@ -224,27 +236,64 @@ def find_highlights(path):
     return out
 
 # ======================================================================
-# TIER 2 — class icon detection (template matching)
+# TIER 2 — class detection via player-name OCR
 # ======================================================================
 
-def roi_pixels(w, h):
-    x0, y0, x1, y1 = ICON_ROI
+def roi_pixels(w, h, roi):
+    x0, y0, x1, y1 = roi
     return int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h)
 
-def crop_roi(img):
+def crop_roi(img, roi):
     h, w = img.shape[:2]
-    x0, y0, x1, y1 = roi_pixels(w, h)
+    x0, y0, x1, y1 = roi_pixels(w, h, roi)
     return img[y0:y1, x0:x1]
 
-def detect_class(path, duration, templates):
-    """Sample frames, match the icon ROI against each template, majority-vote."""
-    if not templates:
-        return None, 0.0
+def preprocess_name(crop):
+    """Upscale + grayscale + Otsu threshold so the light serif text reads well.
+    Returns black-text-on-white, which is what Tesseract prefers."""
+    big = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return th
 
-    # evenly spaced sample times, avoiding the very edges
-    ts = np.linspace(0.15 * duration, 0.85 * duration, ICON_SAMPLES)
-    votes = {}
-    best_overall = 0.0
+def ocr_name(crop):
+    """OCR a single name line."""
+    return pytesseract.image_to_string(
+        preprocess_name(crop), config="--psm 7").strip()
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+def match_roster(text):
+    """Best (class, score) for a roster name aligned anywhere in OCR `text`.
+    Slides each known name across the (normalized) text so leading/trailing
+    OCR junk doesn't sink the score."""
+    t = _norm(text)
+    if not t:
+        return None, 0.0
+    best_cls, best_score = None, 0.0
+    for name, cls in NAME_TO_CLASS.items():
+        n = _norm(name)
+        if not n:
+            continue
+        if len(t) <= len(n):
+            score = difflib.SequenceMatcher(None, n, t).ratio()
+        else:
+            score = max(
+                difflib.SequenceMatcher(None, n, t[i:i + len(n)]).ratio()
+                for i in range(0, len(t) - len(n) + 1)
+            )
+        if score > best_score:
+            best_cls, best_score = cls, score
+    return best_cls, best_score
+
+def detect_class(path, duration):
+    """Sample frames, OCR the name line, fuzzy-match to the roster, vote."""
+    if not NAME_TO_CLASS:
+        return "unknown", 0.0
+
+    ts = np.linspace(0.06 * duration, 0.94 * duration, NAME_SAMPLES)
+    votes, best_overall = {}, 0.0
     tmp = "_cls_frame.png"
 
     for t in ts:
@@ -252,44 +301,17 @@ def detect_class(path, duration, templates):
         frame = cv2.imread(tmp)
         if frame is None:
             continue
-        region = crop_roi(frame)
-        rh, rw = region.shape[:2]
-
-        best_name, best_score = None, 0.0
-        for name, tpl in templates.items():
-            th, tw = tpl.shape[:2]
-            # template must fit inside the search region
-            if th > rh or tw > rw:
-                tpl_fit = cv2.resize(tpl, (min(tw, rw), min(th, rh)))
-            else:
-                tpl_fit = tpl
-            res = cv2.matchTemplate(region, tpl_fit, cv2.TM_CCOEFF_NORMED)
-            score = float(res.max())
-            if score > best_score:
-                best_name, best_score = name, score
-
-        if best_name and best_score >= MATCH_THRESHOLD:
-            votes[best_name] = votes.get(best_name, 0) + 1
-            best_overall = max(best_overall, best_score)
+        cls, score = match_roster(ocr_name(crop_roi(frame, NAME_ROI)))
+        if cls and score >= NAME_MATCH_CUTOFF:
+            votes[cls] = votes.get(cls, 0) + 1
+            best_overall = max(best_overall, score)
 
     if os.path.exists(tmp):
         os.remove(tmp)
 
     if not votes:
-        return None, 0.0
-    winner = max(votes, key=votes.get)
-    return winner, best_overall
-
-def load_templates():
-    templates = {}
-    if not os.path.isdir(TEMPLATE_DIR):
-        return templates
-    for f in glob.glob(os.path.join(TEMPLATE_DIR, "*.png")):
-        name = os.path.splitext(os.path.basename(f))[0]
-        img = cv2.imread(f)
-        if img is not None:
-            templates[name] = img
-    return templates
+        return "unknown", 0.0
+    return max(votes, key=votes.get), best_overall
 
 # ======================================================================
 # Cutting
@@ -323,35 +345,43 @@ def mode_calibrate(args):
     if frame is None:
         sys.exit("Could not read a frame from that clip.")
     h, w = frame.shape[:2]
-    x0, y0, x1, y1 = roi_pixels(w, h)
+    x0, y0, x1, y1 = roi_pixels(w, h, NAME_ROI)
     crop = frame[y0:y1, x0:x1].copy()
+    cv2.imwrite("_calib_crop.png", crop)
+    cv2.imwrite("_calib_ocr.png", preprocess_name(crop))
     cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 0, 255), 2)
     cv2.imwrite("_calib_frame.png", frame)
-    cv2.imwrite("_calib_crop.png", crop)
-    print(f"Frame is {w}x{h}. ROI pixels: x {x0}-{x1}, y {y0}-{y1}")
-    print("Open _calib_frame.png — the red box should sit over the class icon.")
-    print("If it's off, edit ICON_ROI and run calibrate again.")
+    print(f"Frame is {w}x{h}. NAME_ROI pixels: x {x0}-{x1}, y {y0}-{y1}")
+    print(f"OCR of this frame: '{ocr_name(crop)}'")
+    print("Open _calib_frame.png — the red box should sit over the name")
+    print("above your health bar. _calib_ocr.png shows what OCR sees.")
+    print("If it's off, edit NAME_ROI and run calibrate again.")
 
-def mode_addtemplate(args):
-    os.makedirs(TEMPLATE_DIR, exist_ok=True)
+def mode_readname(args):
+    if not NAME_TO_CLASS:
+        print("NAME_TO_CLASS is empty — add your character(s) first.\n")
     dur = probe_duration(args.clip)
-    grab_frame(args.clip, dur / 2.0, "_tpl_frame.png")
-    frame = cv2.imread("_tpl_frame.png")
-    if frame is None:
-        sys.exit("Could not read a frame from that clip.")
-    crop = crop_roi(frame)
-    out = os.path.join(TEMPLATE_DIR, f"{args.name}.png")
-    cv2.imwrite(out, crop)
-    os.remove("_tpl_frame.png")
-    print(f"Saved template for '{args.name}' -> {out}")
-    print("Tip: eyeball it to confirm the icon is centered and not cut off.")
+    ts = np.linspace(0.06 * dur, 0.94 * dur, NAME_SAMPLES)
+    tmp = "_read_frame.png"
+    for t in ts:
+        grab_frame(args.clip, float(t), tmp)
+        frame = cv2.imread(tmp)
+        if frame is None:
+            print(f"  t={t:>5.0f}s  (no frame)")
+            continue
+        raw = ocr_name(crop_roi(frame, NAME_ROI))
+        cls, score = match_roster(raw)
+        print(f"  t={t:>5.0f}s  ocr='{raw}'  -> {cls or '-'} ({score:.2f})")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    cls, score = detect_class(args.clip, dur)
+    print(f"\nVerdict: class={cls} (conf {score:.2f})")
 
 def mode_run(args):
     os.makedirs(args.out, exist_ok=True)
-    templates = load_templates()
-    if not templates:
-        print("WARNING: no templates found — clips will be labeled 'unknown'.\n"
-              "         Run `addtemplate` first for class detection.\n")
+    if not NAME_TO_CLASS:
+        print("WARNING: NAME_TO_CLASS is empty — clips will be labeled 'unknown'.\n"
+              "         Add your character name(s) to the map in CONFIG.\n")
 
     clips = []
     for ext in ("mp4", "mkv", "mov", "MP4", "MKV", "MOV"):
@@ -369,8 +399,7 @@ def mode_run(args):
             print(f"  ! skipping {base}: {e}")
             continue
 
-        cls, score = detect_class(clip, dur, templates)
-        cls = cls or "unknown"
+        cls, score = detect_class(clip, dur)
         hls = find_highlights(clip)
         print(f"{base}: class={cls} (conf {score:.2f}), "
               f"{len(hls)} highlight(s)")
@@ -397,14 +426,13 @@ def main():
     p = argparse.ArgumentParser(description="Dark and Darker montage helper")
     sub = p.add_subparsers(dest="mode", required=True)
 
-    c = sub.add_parser("calibrate", help="check where the class-icon ROI lands")
+    c = sub.add_parser("calibrate", help="check where the name ROI lands")
     c.add_argument("clip")
     c.set_defaults(func=mode_calibrate)
 
-    a = sub.add_parser("addtemplate", help="save the ROI of a clip as a class template")
-    a.add_argument("clip")
-    a.add_argument("--name", required=True, help="class name, e.g. ranger")
-    a.set_defaults(func=mode_addtemplate)
+    rn = sub.add_parser("readname", help="show OCR name reads + matched class")
+    rn.add_argument("clip")
+    rn.set_defaults(func=mode_readname)
 
     r = sub.add_parser("run", help="process a folder of clips")
     r.add_argument("--in", dest="in_dir", default="clips")

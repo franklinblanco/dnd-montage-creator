@@ -62,6 +62,7 @@ dnd-montage/
 └── templates/        # class-icon PNGs from `addtemplate` (git-ignored)
 ```
 
-## Roadmap
+## Notes
 
-- Kill-feed template matching for precise kill montages.
+Dark and Darker has no in-game kill feed, so kill detection has to come from
+other signals (audio loudness, on-screen events) rather than reading a feed.
