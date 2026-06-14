@@ -3,9 +3,11 @@
 dnd_montage.py — Dark and Darker montage helper
 
 Two jobs:
-  1) TIER 1  -> find the loud/action moments in each clip (audio loudness).
+  1) TIER 1  -> find the fights in each clip from your voice callouts. We
+                transcribe your commentary (Whisper) and cluster combat keywords
+                ("hit him", "one dead", ...) into whole-fight windows.
   2) TIER 2  -> read which class you were playing from your character name
-                (shown above the health bar), via OCR + a name->class map.
+                (shown above the health bar), via OCR.
 
 It does NOT auto-stitch by default. It cuts each highlight into its own file,
 named with the detected class, so you can drag them into DaVinci Resolve and
@@ -16,9 +18,11 @@ SETUP (once)
 ----------------------------------------------------------------------
   - Install FFmpeg + Tesseract and put `ffmpeg`/`ffprobe`/`tesseract` on PATH.
       macOS:  brew install ffmpeg tesseract
-  - pip install -r requirements.txt   (numpy, opencv-python, pytesseract)
+  - pip install -r requirements.txt   (numpy, opencv-python, pytesseract,
+    faster-whisper). The Whisper model downloads itself on first use.
   - Class is read from your character name (names embed their class). Only add
     a line to NAME_OVERRIDES below for a character whose name does NOT.
+  - Tune the KILL_WORDS / ENGAGE_WORDS lists to match how YOU talk in fights.
 
 ----------------------------------------------------------------------
 WORKFLOW
@@ -30,23 +34,25 @@ WORKFLOW
          OCR actually sees). The red box should sit over the name above your
          health bar. If it's off, tweak NAME_ROI below and run again.
 
-  Step 2 — sanity-check the read on a clip (optional):
-      python dnd_montage.py readname "clips/some_clip.mkv"
-      -> prints the raw OCR per sampled frame and the class it matched.
+  Step 2 — sanity-check the reads on a clip (optional):
+      python dnd_montage.py readname "clips/some_clip.mkv"   # class from name
+      python dnd_montage.py callouts "clips/some_clip.mkv"   # transcript + fights
 
   Step 3 — process a whole folder:
       python dnd_montage.py run --in clips --out output
       -> output/ranger__some_clip__hl01.mp4, etc.
          Add --stitch to also get output/_montage_all.mp4
 
-Tuning: everything you'll want to touch lives in the CONFIG block below.
-The two knobs that matter most are LOUDNESS_PERCENTILE (higher = pickier)
-and PAD_BEFORE / PAD_AFTER (how much lead-in / tail each highlight gets).
+Tuning: everything you'll want to touch lives in the CONFIG block below. The
+knobs that matter most are the KILL_WORDS / ENGAGE_WORDS keyword lists (match
+how you talk), CLUSTER_GAP (how far apart callouts can be and still count as one
+fight), and PAD_BEFORE / PAD_AFTER (lead-in / tail around each fight).
 """
 
 import argparse
 import os
 import re
+import json
 import subprocess
 import sys
 import glob
@@ -60,31 +66,33 @@ import pytesseract
 # CONFIG — tune these
 # ======================================================================
 
-# --- Audio / highlight detection (Tier 1) ---
-AUDIO_SR          = 8000   # Hz to downsample audio to for analysis (plenty for loudness)
-WIN_SEC           = 0.40   # length of each loudness measurement window
-HOP_SEC           = 0.10   # how far the window slides each step
-SMOOTH_SEC        = 0.50   # moving-average smoothing over the loudness curve
+# --- Highlight detection via voice callouts (Tier 1) ---
+# We transcribe your commentary with Whisper and find fights by where your
+# combat callouts cluster — a fight is the whole span from your first callout to
+# your last, which keeps the moment intact through quiet stretches (loudness
+# can't do that). Keywords match as case-insensitive substrings, so "dead"
+# catches "he's dead", "one dead", "ranger dead", etc. Weights say how strongly
+# a phrase implies a real fight; kills weigh most.
+WHISPER_MODEL     = "small.en"  # faster-whisper model: tiny/base/small/medium .en
 
-LOUDNESS_PERCENTILE = 95.0 # a moment counts as "action" if louder than this %
-                           #   of the clip. Higher = fewer, punchier highlights.
-ABS_FLOOR_DB      = -40.0  # never flag anything quieter than this (kills silence)
+# Kills / downs — the payoff. ("dead" covers "he's dead", "one dead", "X dead".)
+KILL_WORDS   = ["dead", "got him", "got one", "killed"]
+# Engaging / in a fight.
+ENGAGE_WORDS = ["hit him", "hit", "shooting", "shoot", "push", "running", "run",
+                "players", "people", "trail", "behind", "coming", "reset"]
+# Scouting — sizing up an enemy by gear/class. Soft signal (also said off-fight).
+SCOUT_WORDS  = ["geared", "kitted", "naked", "ranger", "rogue", "fighter",
+                "wizard", "sorcerer", "druid", "barbarian", "bard", "cleric",
+                "warlock"]
+KILL_W, ENGAGE_W, SCOUT_W = 3.0, 1.0, 0.3   # per-keyword weights
 
-PAD_BEFORE        = 3.0    # seconds of lead-in before a detected peak
-PAD_AFTER         = 5.0    # seconds of tail after it
-MERGE_GAP         = 6.0    # merge two highlights if they're within this many sec
-MIN_HL_SEC        = 2.0    # drop highlights shorter than this
-MAX_HL_SEC        = 30.0   # hard cap on a single highlight's length
-
-# End-bias: clips come from a replay buffer, so the payoff is almost always
-# near the END (you clip after a fight / while looting). Favor the tail, and
-# treat the very start skeptically so early ambient loudness doesn't crowd in.
-# (Action at the start usually means a double-clip or a long fight — still
-# caught, but it has to be genuinely loud to clear the raised bar.)
-END_ZONE_SEC      = 90.0   # the final this-many seconds are the "payoff zone"
-END_BOOST_DB      = 4.0    # lower the loudness bar by this much in the end zone
-START_GUARD_SEC   = 30.0   # the first this-many seconds are treated skeptically
-START_GUARD_DB    = 5.0    # raise the loudness bar by this much in the start guard
+CLUSTER_GAP        = 12.0  # callouts within this many sec belong to one fight
+MIN_CLUSTER_WEIGHT = 2.0   # a fight must score at least this (any kill always
+                           #   qualifies, regardless of weight)
+PAD_BEFORE         = 4.0   # lead-in before a fight's first callout
+PAD_AFTER          = 6.0   # tail after its last callout (keeps the kill/aftermath)
+MIN_HL_SEC         = 3.0   # drop fight windows shorter than this
+MAX_HL_SEC         = 75.0  # hard cap on a single fight window
 
 # --- Class detection via player-name OCR (Tier 2) ---
 # Your character name is drawn above the health bar (bottom-center). We OCR it
@@ -176,98 +184,94 @@ def grab_frame(path, t, out_png):
     return out_png
 
 # ======================================================================
-# TIER 1 — loudness-based highlight detection
+# TIER 1 — highlight detection via voice callouts (Whisper transcription)
 # ======================================================================
 
-def load_audio(path):
-    """Decode to mono PCM float in [-1, 1] via ffmpeg piped through numpy."""
-    raw = run_quiet([
-        "ffmpeg", "-i", path, "-ac", "1", "-ar", str(AUDIO_SR),
-        "-f", "s16le", "-v", "quiet", "-"
-    ]).stdout
-    if not raw:
-        raise RuntimeError(f"No audio decoded from {path}")
-    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+TRANSCRIBE_CACHE = ".transcripts"
+_WHISPER = None
 
-def loudness_curve(samples):
-    """Return (times, dB) — windowed RMS loudness over the clip."""
-    win_n = int(AUDIO_SR * WIN_SEC)
-    hop_n = int(AUDIO_SR * HOP_SEC)
-    times, db = [], []
-    for start in range(0, max(1, len(samples) - win_n), hop_n):
-        seg = samples[start:start + win_n]
-        rms = np.sqrt(np.mean(seg * seg)) + 1e-9
-        db.append(20.0 * np.log10(rms))
-        times.append(start / AUDIO_SR)
-    times, db = np.array(times), np.array(db)
-    # smooth
-    k = max(1, int(SMOOTH_SEC / HOP_SEC))
-    if k > 1 and len(db) >= k:
-        db = np.convolve(db, np.ones(k) / k, mode="same")
-    return times, db
+def _whisper():
+    """Lazily load the Whisper model once (reused across clips in a run)."""
+    global _WHISPER
+    if _WHISPER is None:
+        from faster_whisper import WhisperModel
+        _WHISPER = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    return _WHISPER
 
-def find_highlights(path):
-    """Return a list of (start, end) second-windows of action in the clip."""
-    samples = load_audio(path)
-    times, db = loudness_curve(samples)
-    if len(db) == 0:
+def transcribe(path):
+    """Return [(start, end, text)] for the clip's commentary, cached to
+    .transcripts/<clip>.json and invalidated when the source file changes."""
+    os.makedirs(TRANSCRIBE_CACHE, exist_ok=True)
+    cache = os.path.join(TRANSCRIBE_CACHE, os.path.basename(path) + ".json")
+    mtime = os.path.getmtime(path)
+    if os.path.exists(cache):
+        with open(cache) as fh:
+            data = json.load(fh)
+        if data.get("src_mtime") == mtime and data.get("model") == WHISPER_MODEL:
+            return data["segments"]
+
+    wav = "_asr.wav"
+    run_quiet(["ffmpeg", "-i", path, "-ac", "1", "-ar", "16000",
+               "-f", "wav", "-y", "-v", "quiet", wav])
+    segments, _ = _whisper().transcribe(wav, vad_filter=True, language="en")
+    segs = [[round(s.start, 3), round(s.end, 3), s.text.strip()]
+            for s in segments]
+    if os.path.exists(wav):
+        os.remove(wav)
+    with open(cache, "w") as fh:
+        json.dump({"src_mtime": mtime, "model": WHISPER_MODEL, "segments": segs}, fh)
+    return segs
+
+def score_text(text):
+    """Return (weight, has_kill) for a transcript line from its callout words."""
+    t = text.lower()
+    weight, kill = 0.0, False
+    for k in KILL_WORDS:
+        if k in t:
+            weight += KILL_W
+            kill = True
+    for k in ENGAGE_WORDS:
+        if k in t:
+            weight += ENGAGE_W
+    for k in SCOUT_WORDS:
+        if k in t:
+            weight += SCOUT_W
+    return weight, kill
+
+def fight_windows(segments, duration):
+    """Cluster scored callouts into whole-fight windows. Returns a time-ordered
+    list of (start, end, weight, has_kill)."""
+    events = []
+    for s, e, text in segments:
+        w, kill = score_text(text)
+        if w > 0:
+            events.append((s, e, w, kill))
+    if not events:
         return []
 
-    clip_dur = times[-1] + WIN_SEC
-
-    # Position-dependent loudness bar: a single percentile gives one global
-    # threshold; we nudge it by clip position so the replay-buffer payoff (near
-    # the end) is easy to clear, while the start has to be genuinely loud.
-    base = max(np.percentile(db, LOUDNESS_PERCENTILE), ABS_FLOOR_DB)
-    thr = np.full_like(db, base)
-    thr[times >= clip_dur - END_ZONE_SEC] -= END_BOOST_DB
-    thr[times <= START_GUARD_SEC]         += START_GUARD_DB
-    thr = np.maximum(thr, ABS_FLOOR_DB)
-    mask = db >= thr
-
-    # contiguous runs of "loud" -> raw segments
-    segs = []
-    i, n = 0, len(mask)
-    while i < n:
-        if mask[i]:
-            j = i
-            while j < n and mask[j]:
-                j += 1
-            segs.append([times[i], times[j - 1]])
-            i = j
+    # group callouts that are close in time into one fight
+    clusters = []
+    for s, e, w, kill in events:
+        if clusters and s - clusters[-1]["end"] <= CLUSTER_GAP:
+            c = clusters[-1]
+            c["end"] = max(c["end"], e)
+            c["weight"] += w
+            c["kill"] = c["kill"] or kill
         else:
-            i += 1
+            clusters.append({"start": s, "end": e, "weight": w, "kill": kill})
 
-    # pad, clamp
-    segs = [[max(0.0, s - PAD_BEFORE), min(clip_dur, e + PAD_AFTER)]
-            for s, e in segs]
-
-    # merge ones that are close together
-    merged = []
-    for s, e in segs:
-        if merged and s <= merged[-1][1] + MERGE_GAP:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-
-    # length filters
     out = []
-    for s, e in merged:
+    for c in clusters:
+        # a lone stray callout isn't a fight — but any kill always qualifies
+        if not c["kill"] and c["weight"] < MIN_CLUSTER_WEIGHT:
+            continue
+        s = max(0.0, c["start"] - PAD_BEFORE)
+        e = min(duration, c["end"] + PAD_AFTER)
         if e - s < MIN_HL_SEC:
             continue
         if e - s > MAX_HL_SEC:
             e = s + MAX_HL_SEC
-        out.append((round(s, 3), round(e, 3)))
-
-    # Safety net: if nothing cleared the bar, keep the single loudest moment so
-    # a clip with real action never silently yields zero highlights.
-    if not out:
-        peak = int(np.argmax(db))
-        s = max(0.0, times[peak] - PAD_BEFORE)
-        e = min(clip_dur, times[peak] + PAD_AFTER)
-        if e - s >= MIN_HL_SEC:
-            out = [(round(s, 3), round(e, 3))]
-
+        out.append((round(s, 3), round(e, 3), round(c["weight"], 1), c["kill"]))
     return out
 
 # ======================================================================
@@ -436,6 +440,26 @@ def mode_readname(args):
     else:
         print(f"Verdict: class={cls} (conf {score:.2f})")
 
+def mode_callouts(args):
+    """Diagnostic: show the transcript with keyword scores and the fight windows
+    they produce — use this to tune the keyword lists."""
+    dur = probe_duration(args.clip)
+    segments = transcribe(args.clip)
+    print(f"duration {dur:.0f}s — transcript (score / KILL flag):\n")
+    for s, e, text in segments:
+        w, kill = score_text(text)
+        if w > 0:
+            print(f"  [{s:6.1f}-{e:6.1f}] ({w:.1f}{' KILL' if kill else ''}) {text}")
+        else:
+            print(f"  [{s:6.1f}-{e:6.1f}]        {text}")
+    print("\nFight windows:")
+    fights = fight_windows(segments, dur)
+    if not fights:
+        print("  (none)")
+    for i, (s, e, w, kill) in enumerate(fights, 1):
+        tag = " KILL" if kill else ""
+        print(f"  hl{i:02d}  [{s:.1f}s - {e:.1f}s]  score {w:.1f}{tag}")
+
 def mode_run(args):
     os.makedirs(args.out, exist_ok=True)
 
@@ -463,20 +487,22 @@ def mode_run(args):
             continue
 
         hit_times = name_hit_times(scan)
-        hls = find_highlights(clip)
-        kept = [(s, e) for s, e in hls if is_gameplay(hit_times, s, e)]
-        skipped = len(hls) - len(kept)
-        msg = f"{base}: class={cls} (conf {score:.2f}), {len(kept)} highlight(s)"
+        fights = fight_windows(transcribe(clip), dur)
+        kept = [(s, e, w, k) for s, e, w, k in fights
+                if is_gameplay(hit_times, s, e)]
+        skipped = len(fights) - len(kept)
+        msg = f"{base}: class={cls} (conf {score:.2f}), {len(kept)} fight(s)"
         if skipped:
             msg += f", {skipped} skipped (menu/market)"
         print(msg)
 
-        for idx, (s, e) in enumerate(kept, 1):
+        for idx, (s, e, w, kill) in enumerate(kept, 1):
             out_name = f"{cls}__{base}__hl{idx:02d}.mp4"
             out_path = os.path.join(args.out, out_name)
             cut(clip, s, e, out_path)
             all_outputs.append(out_path)
-            print(f"    -> {out_name}  [{s:.1f}s - {e:.1f}s]")
+            tag = " KILL" if kill else ""
+            print(f"    -> {out_name}  [{s:.1f}s - {e:.1f}s]  score {w:.1f}{tag}")
 
     if args.stitch and all_outputs:
         montage = os.path.join(args.out, "_montage_all.mp4")
@@ -500,6 +526,10 @@ def main():
     rn = sub.add_parser("readname", help="show OCR name reads + matched class")
     rn.add_argument("clip")
     rn.set_defaults(func=mode_readname)
+
+    co = sub.add_parser("callouts", help="show transcript, keyword scores, windows")
+    co.add_argument("clip")
+    co.set_defaults(func=mode_callouts)
 
     r = sub.add_parser("run", help="process a folder of clips")
     r.add_argument("--in", dest="in_dir", default="clips")

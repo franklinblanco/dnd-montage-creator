@@ -10,12 +10,16 @@ output/*
 !clips/.gitkeep
 !output/.gitkeep
 
-# Generated class templates (image library; regenerate with addtemplate)
-templates/*.png
+# Cached Whisper transcripts (regenerated from clips on demand)
+.transcripts/
 
 # Scratch files the script writes to cwd
 _calib_frame.png
 _calib_crop.png
+_calib_ocr.png
 _cls_frame.png
-_tpl_frame.png
+_scan_frame.png
+_read_frame.png
+_asr.wav
+_asr_probe.py
 _concat_list.txt
