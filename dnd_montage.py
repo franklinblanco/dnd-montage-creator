@@ -262,9 +262,18 @@ def combat_red_px(frame):
     m2 = cv2.inRange(hsv, (168, 110, 70), (180, 255, 255))
     return int(((m1 | m2) > 0).sum())
 
-def combat_segments(path, duration):
-    """Scan the clip for the in-combat debuff and return merged combat spans
-    [(start, end)] — these are ALL combat (PvP and PvE)."""
+def scan_combat_times(path):
+    """Times (sec) where the in-combat debuff was on, sampled at COMBAT_FPS.
+    Cached to .transcripts/<clip>.combat.json, invalidated by file/param change."""
+    os.makedirs(TRANSCRIBE_CACHE, exist_ok=True)
+    cache = os.path.join(TRANSCRIBE_CACHE, os.path.basename(path) + ".combat.json")
+    key = [os.path.getmtime(path), list(COMBAT_ROI), COMBAT_RED_MIN, COMBAT_FPS]
+    if os.path.exists(cache):
+        with open(cache) as fh:
+            data = json.load(fh)
+        if data.get("key") == key:
+            return data["hits"]
+
     tmpdir = tempfile.mkdtemp(prefix="dndcombat_")
     try:
         run_quiet(["ffmpeg", "-i", path, "-vf", f"fps={COMBAT_FPS}", "-q:v", "3",
@@ -273,12 +282,17 @@ def combat_segments(path, duration):
         for i, fp in enumerate(sorted(glob.glob(os.path.join(tmpdir, "f_*.jpg")))):
             frame = cv2.imread(fp)
             if frame is not None and combat_red_px(frame) >= COMBAT_RED_MIN:
-                hits.append(i / COMBAT_FPS)
+                hits.append(round(i / COMBAT_FPS, 2))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    with open(cache, "w") as fh:
+        json.dump({"key": key, "hits": hits}, fh)
+    return hits
 
+def combat_segments(path, duration):
+    """Merged combat spans [(start, end)] — these are ALL combat (PvP and PvE)."""
     segs = []
-    for t in hits:
+    for t in scan_combat_times(path):
         if segs and t - segs[-1][1] <= COMBAT_MERGE_GAP:
             segs[-1][1] = t
         else:
@@ -539,6 +553,113 @@ def mode_callouts(args):
         tag = " KILL" if kill else ""
         print(f"  hl{i:02d}  [{s:.1f}s - {e:.1f}s]  PvP-score {w:.1f}{tag}")
 
+def _mmss(t):
+    return f"{int(t)//60}:{int(t)%60:02d}"
+
+def analyze_clip(path):
+    """Gather everything the report needs for one clip."""
+    dur = probe_duration(path)
+    scan = scan_names(path, dur)
+    cls, _ = vote_class(scan)
+    combat = combat_segments(path, dur)
+    callouts = []
+    for s, e, text in transcribe(path):
+        w, kill = score_text(text)
+        if w > 0:
+            callouts.append({"s": s, "e": e, "w": w, "kill": kill, "text": text})
+    fights = fight_windows(path, dur)
+    return {"path": path, "name": os.path.splitext(os.path.basename(path))[0],
+            "dur": dur, "cls": cls, "combat": combat,
+            "callouts": callouts, "fights": fights}
+
+def mode_report(args):
+    """Build a self-contained HTML dashboard for a folder of clips: per clip, a
+    player + a timeline (orange=in combat/likely PvE, red=PvP fight, ticks=kills)
+    and a clickable kill/fight list that seeks the video."""
+    import html as _html
+    from urllib.parse import quote
+
+    clips = []
+    for ext in ("mp4", "mkv", "mov", "MP4", "MKV", "MOV"):
+        clips += glob.glob(os.path.join(args.in_dir, f"*.{ext}"))
+    clips = sorted(set(clips))
+    if not clips:
+        sys.exit(f"No video files found in {args.in_dir}")
+
+    sections = []
+    for clip in clips:
+        try:
+            a = analyze_clip(clip)
+        except RuntimeError as e:
+            print(f"  ! skipping {os.path.basename(clip)}: {e}")
+            continue
+        dur = a["dur"] or 1.0
+        pct = lambda t: 100.0 * t / dur
+        bands = "".join(
+            f'<div class="band combat" style="left:{pct(s):.2f}%;'
+            f'width:{pct(e-s):.2f}%"></div>' for s, e in a["combat"])
+        bands += "".join(
+            f'<div class="band fight" style="left:{pct(s):.2f}%;'
+            f'width:{pct(e-s):.2f}%" title="fight {_mmss(s)}-{_mmss(e)}'
+            f'{ " KILL" if k else ""}"></div>' for s, e, w, k in a["fights"])
+        ticks = "".join(
+            f'<div class="tick{" kill" if c["kill"] else ""}" '
+            f'style="left:{pct(c["s"]):.2f}%" title="{_html.escape(c["text"])}"></div>'
+            for c in a["callouts"])
+        items = []
+        for i, (s, e, w, k) in enumerate(a["fights"], 1):
+            tag = " <b>KILL</b>" if k else ""
+            items.append(f'<li data-t="{s:.1f}">🎬 fight hl{i:02d} '
+                         f'[{_mmss(s)}–{_mmss(e)}] score {w}{tag}</li>')
+        for c in a["callouts"]:
+            if c["kill"]:
+                items.append(f'<li data-t="{c["s"]:.1f}">💀 {_mmss(c["s"])} '
+                             f'— "{_html.escape(c["text"])}"</li>')
+        src = "file://" + quote(os.path.abspath(clip))
+        sections.append(f"""
+  <section>
+    <h2>{_html.escape(a["name"])} <small>({a["cls"]}, {_mmss(dur)})</small></h2>
+    <video controls preload="none" src="{src}"></video>
+    <div class="timeline" data-dur="{dur:.2f}" onclick="tl(event,this)">
+      {bands}{ticks}
+    </div>
+    <ul class="markers">{''.join(items) or '<li>(no fights detected)</li>'}</ul>
+  </section>""")
+
+    doc = f"""<!doctype html><meta charset="utf-8">
+<title>dnd-montage report — {_html.escape(os.path.basename(args.in_dir.rstrip('/')))}</title>
+<style>
+  body{{font:14px system-ui;background:#1a1a1a;color:#ddd;margin:24px;max-width:960px}}
+  section{{border-top:1px solid #333;padding:16px 0}}
+  h2{{margin:0 0 8px}} small{{color:#888;font-weight:400}}
+  video{{max-width:480px;background:#000;display:block;margin-bottom:8px}}
+  .timeline{{position:relative;height:34px;background:#222;border-radius:4px;cursor:pointer;overflow:hidden}}
+  .band{{position:absolute;top:0;height:100%}}
+  .band.combat{{background:rgba(230,150,40,.45)}}
+  .band.fight{{background:rgba(220,40,40,.55);border:1px solid #f33}}
+  .tick{{position:absolute;top:0;width:2px;height:100%;background:#888}}
+  .tick.kill{{background:#ff3b3b;width:3px}}
+  .markers{{list-style:none;padding:0;margin:8px 0 0}}
+  .markers li{{padding:3px 6px;cursor:pointer;border-radius:3px}}
+  .markers li:hover{{background:#2c2c2c}}
+  .legend span{{margin-right:16px}} .sw{{display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:-1px;margin-right:4px}}
+</style>
+<h1>dnd-montage report</h1>
+<p class="legend">
+  <span><i class="sw" style="background:rgba(230,150,40,.7)"></i>in combat (likely PvE)</span>
+  <span><i class="sw" style="background:rgba(220,40,40,.8)"></i>PvP fight</span>
+  <span><i class="sw" style="background:#ff3b3b"></i>kill callout</span>
+</p>
+{''.join(sections)}
+<script>
+document.querySelectorAll('.markers li[data-t]').forEach(li=>li.onclick=()=>{{const v=li.closest('section').querySelector('video');v.currentTime=+li.dataset.t;v.play();}});
+function tl(e,el){{const r=el.getBoundingClientRect();const dur=+el.dataset.dur;const v=el.closest('section').querySelector('video');v.currentTime=(e.clientX-r.left)/r.width*dur;v.play();}}
+</script>"""
+
+    with open(args.out, "w") as fh:
+        fh.write(doc)
+    print(f"Wrote {args.out}  ({len(sections)} clip(s)). Open it in a browser.")
+
 def mode_run(args):
     os.makedirs(args.out, exist_ok=True)
 
@@ -609,6 +730,11 @@ def main():
     co = sub.add_parser("callouts", help="show transcript, keyword scores, windows")
     co.add_argument("clip")
     co.set_defaults(func=mode_callouts)
+
+    rp = sub.add_parser("report", help="build an HTML dashboard (timelines/kills)")
+    rp.add_argument("--in", dest="in_dir", required=True)
+    rp.add_argument("--out", dest="out", default="report.html")
+    rp.set_defaults(func=mode_report)
 
     r = sub.add_parser("run", help="process a folder of clips")
     r.add_argument("--in", dest="in_dir", default="clips")

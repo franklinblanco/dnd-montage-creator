@@ -1,85 +1,66 @@
 # dnd-montage
 
-Auto-edits **Dark and Darker** montages from a folder of recorded clips.
+Auto-finds the **PvP fights** in **Dark and Darker** clips and cuts each to its
+own MP4 for editing.
 
-Two stages run over each clip:
+## How it works
 
-- **Tier 1 — highlight detection (audio loudness).** Extracts mono PCM via
-  ffmpeg, computes a windowed RMS loudness curve, flags moments above a
-  per-clip percentile threshold, then pads + merges them into highlight
-  windows.
-- **Tier 2 — class detection (player-name OCR).** Reads your character name
-  from above the health bar (bottom-center) with Tesseract, fuzzy-matches it
-  against a `NAME_TO_CLASS` roster, and majority-votes across a few sampled
-  frames per clip (your character is constant within a clip).
+- **Tier 1 — fight detection (visual + voice).** You clip via a replay buffer
+  right after a fight, so every clip contains a PvP fight, usually near the end.
+  - *Visual:* the red crossed-swords **in-combat debuff** (in the buff grid above
+    your card) is detected per frame (red-pixel count) → contiguous **combat
+    segments**. Reliable, but fires on PvE mobs too.
+  - *Structure (Path A):* always emit the **closing fight** — the last combat
+    window near the clip's end (no voice needed) — plus any earlier **narrated
+    kill** (Whisper transcript + kill keywords) as its own window.
+- **Tier 2 — class detection.** OCR your character name above the health bar,
+  read the class embedded in it (e.g. `…RANGER` → ranger), majority-vote.
+- **Menu/market gate.** Clips with no character name on screen are skipped.
 
-Each highlight is cut to its own MP4 (re-encoded for frame-accurate cuts,
-libx264 CRF 18), named `<class>__<clipname>__hlNN.mp4`. It does **not**
-auto-stitch by default — drop the cuts into your editor (e.g. DaVinci Resolve)
-and arrange them. Pass `--stitch` to also get one concatenated file.
+Each fight is cut to `output/<class>__<clip>__hlNN.mp4` (libx264 CRF 18,
+frame-accurate). Pass `--stitch` to also get one concatenated file.
 
 ## Requirements
 
-- `ffmpeg`, `ffprobe`, and `tesseract` on your `PATH`:
+```sh
+brew install ffmpeg tesseract
+pip install -r requirements.txt          # numpy, opencv-python, pytesseract, faster-whisper
+```
 
-  ```sh
-  brew install ffmpeg tesseract
-  ```
-
-- Python 3 with the packages in `requirements.txt`:
-
-  ```sh
-  pip install -r requirements.txt
-  ```
-
-- Fill in `NAME_TO_CLASS` at the top of `dnd_montage.py` — map each of *your*
-  character names to its class. Clips whose name matches none are `unknown`.
+The Whisper model downloads itself on first use. Transcripts and combat scans
+are cached under `.transcripts/`.
 
 ## Usage
 
 ```sh
-# 1. Check the name ROI box lands on your character name (run once)
+# Check the name ROI lands on your character name (once)
 python dnd_montage.py calibrate clips/some_clip.mkv
 
-# 2. (Optional) sanity-check the OCR read + matched class on a clip
-python dnd_montage.py readname clips/some_clip.mkv
+# Diagnostics for a single clip
+python dnd_montage.py readname clips/some_clip.mkv    # class from name
+python dnd_montage.py callouts clips/some_clip.mkv    # combat segments + voice + windows
 
-# 3. Process a whole folder
+# Process a whole folder
 python dnd_montage.py run --in clips --out output [--stitch]
+
+# Build an HTML dashboard (timelines, kills, in-combat vs PvP) for a folder
+python dnd_montage.py report --in clips --out report.html
 ```
 
 ## Tuning
 
-The knobs live in the `CONFIG` block at the top of `dnd_montage.py`:
+Knobs live in the `CONFIG` block of `dnd_montage.py`:
 
-- `LOUDNESS_PERCENTILE` — higher = fewer, punchier highlights.
-- `PAD_BEFORE` / `PAD_AFTER` — lead-in / tail around each detected peak.
-- `END_ZONE_SEC` / `END_BOOST_DB` — clips come from a replay buffer, so the
-  payoff is near the end; this lowers the loudness bar in the final stretch.
-- `START_GUARD_SEC` / `START_GUARD_DB` — raises the bar early, so isolated
-  start-of-clip loudness has to be genuinely loud to count.
-- `NAME_OVERRIDES` — character names that don't embed their class (`name → class`).
-- `NAME_ROI` — the name-line box, as frame fractions; tune with `calibrate`.
-- `NAME_MATCH_CUTOFF` — min fuzzy-match score (0–1) to accept a class.
-- `MARKET_CTX_SEC` — if the name never shows within this many seconds of a
-  highlight, it's treated as menu/market and skipped (clips with no name at all
-  are skipped entirely).
-
-MKV is handled, and `probe_duration` has fallbacks for non-finalized recordings
-(e.g. an OBS crash).
-
-## Layout
-
-```
-dnd-montage/
-├── dnd_montage.py    # the tool
-├── clips/            # drop your raw recordings here (git-ignored)
-└── output/           # cut highlights land here (git-ignored)
-```
+- **Visual:** `COMBAT_ROI` (buff grid above your card), `COMBAT_RED_MIN`
+  (red px to count a frame as in-combat), `COMBAT_MERGE_GAP`, `COMBAT_MIN_SEC`.
+- **Structure / Path A:** `CLOSING_FIGHT_SEC` (length of the end-of-clip fight
+  window), `PAD_BEFORE` / `PAD_AFTER`, `MAX_HL_SEC`.
+- **Voice:** `KILL_WORDS` / `ENGAGE_WORDS` (match how you talk), `WHISPER_MODEL`.
+- **Class:** `NAME_OVERRIDES`, `NAME_ROI`, `NAME_MATCH_CUTOFF`.
 
 ## Notes
 
-- Dark and Darker has no in-game kill feed, so kill detection has to come from
-  other signals (audio loudness, on-screen events) rather than reading a feed.
-- Class names in clip *titles* (e.g. `…rogue-fighter`) are typically the
-  *opponents* fought, for sorting — not the player's own class.
+- DnD has no kill feed and no enemy nameplates; combat is near-continuous (PvE),
+  and health loss doesn't separate PvP from PvE — hence the replay-buffer
+  "closing fight" structure (Path A) rather than trying to classify PvP directly.
+- Class names in clip *titles* are usually the opponents fought, not your class.
