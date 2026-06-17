@@ -47,6 +47,24 @@ python dnd_montage.py run --in clips --out output [--stitch]
 python dnd_montage.py report --in clips --out report.html
 ```
 
+## AI seed labeling (Phase 1)
+
+The heuristic detector finds *candidate* fight windows but can't tell PvP from PvE
+(the in-combat debuff fires on mobs too). `seed.py` labels those windows once with
+Claude vision — PvP or not, montage score 0–10, plus highlight categories — and
+writes a training set to `.labels/` for a free local model to learn from later.
+This one-time step is the only paid part; see [DESIGN.md](DESIGN.md) for the plan.
+
+```sh
+pip install anthropic
+export ANTHROPIC_API_KEY=...
+python seed.py --in clips --dry-run    # preview windows + ~cost, no API call
+python seed.py --in clips              # run the one-time seed (~$1 on a small library)
+```
+
+Needs the **source** clips present (point `--in` at them). Runs on any machine with
+ffmpeg + the requirements — no GPU. The local model and training come in later phases.
+
 ## Tuning
 
 Knobs live in the `CONFIG` block of `dnd_montage.py`:

@@ -2,3 +2,4 @@ numpy
 opencv-python
 pytesseract
 faster-whisper
+anthropic  # Phase 1 seed only (seed.py); not needed for local-only use

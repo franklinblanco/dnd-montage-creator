@@ -4,14 +4,25 @@ __pycache__/
 .venv/
 venv/
 
+# macOS
+.DS_Store
+**/.DS_Store
+
 # Media in/out — keep these out of git
 clips/*
 output/*
+reports/
 !clips/.gitkeep
 !output/.gitkeep
 
 # Cached Whisper transcripts (regenerated from clips on demand)
 .transcripts/
+
+# Model label store (training data) + trained student. Generated, can be large —
+# kept out of git, but .labels/ is your hard-won training asset: back it up and
+# sync it between machines (it's how the Mac<->PC handoff works).
+.labels/
+models/
 
 # Scratch files the script writes to cwd
 _calib_frame.png
