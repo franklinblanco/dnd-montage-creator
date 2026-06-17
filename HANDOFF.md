@@ -17,8 +17,11 @@ full plan; this file is the practical "where we are / what's next."
   doubles as a calibration set.
 - **Phase 1 = DONE** (built + unit-tested, **not run live**): `frames.py`,
   `judge.py`, `labels.py`, `seed.py`. Spec in DESIGN.md §10.
-- **Phase 2 = NEXT** (the PC work): local VLM teacher + calibration, then the
-  student trainer.
+- **Phase 2, steps 1–2 = DONE** (built + unit-tested, **not run live**):
+  `LocalVLMJudge` (free Qwen teacher via Ollama), `seed.py --judge local`,
+  `calibrate.py`. Need Ollama + a completed seed to run.
+- **Phase 2, steps 3–4 = NEXT** (the PC work): the student trainer (`train.py`) +
+  wiring `--judge` into `dnd_montage.py run`.
 
 ## Architecture (where things plug in)
 
@@ -76,17 +79,21 @@ Output: `.labels/<clip>.json` records with `source:"claude"`.
 
 ## Phase 2 — build next, in order
 
-1. **`LocalVLMJudge.score()` (judge.py).** Call Ollama: `POST {host}/api/chat` with
-   `model="qwen2.5vl:7b"`, a user message carrying the rubric+context text and
-   `images=[<base64 jpeg>, ...]`, and `format=judge.output_schema()` (recent Ollama
-   takes a JSON schema in `format`). Parse → `Verdict` (clamp confidence, validate
-   the category enum). Reuse `judge.SYSTEM` and `frames.sample_window`. Add a
-   `--judge {claude,local}` flag to `seed.py` so it can label with either backend.
-2. **`calibrate.py`.** Re-label the seed windows with `LocalVLMJudge` and compare to
-   the existing `source:"claude"` records in `.labels/`: is_pvp agreement %,
-   montage_score MAE, category overlap. Tells you how much to trust the free teacher
-   before using it at scale.
-3. **`train.py` (the student).** For each labeled window: sample frames → embed with
+1. **`LocalVLMJudge.score()` (judge.py). — DONE.** Talks to Ollama `POST /api/chat`
+   over stdlib HTTP (no `ollama` package dep, so judge.py stays light): system =
+   `judge.SYSTEM`, user text = shared `_window_header` + frame timestamps, frames in
+   the message `images` list as base64 JPEG, `format=output_schema()`, temp 0.
+   `_parse_verdict` (shared with `ClaudeJudge`) clamps confidence and enum-filters
+   categories. `seed.py` gained `--judge {claude,local}` (+ `--ollama-host`); local
+   runs synchronously and writes `source:"local_vlm"`. **Not yet run live** — needs
+   `ollama serve` + `ollama pull qwen2.5vl:7b`.
+2. **`calibrate.py`. — DONE.** Re-labels the `source:"claude"` windows with
+   `LocalVLMJudge` and reports is_pvp agreement + PvP confusion (Claude=truth),
+   montage_score MAE / within-±1, and mean category Jaccard. `--out` dumps the
+   per-window comparison. **Needs the seed to have run first** (so claude labels
+   exist) and Ollama up. Local verdicts aren't written to `.labels/` (trust order
+   would drop them under the claude label anyway).
+3. **`train.py` (the student). — NEXT.** For each labeled window: sample frames → embed with
    open_clip ViT-L/14 (cache embeddings per clip, like `.transcripts/`) → mean to a
    window vector. Train sklearn LogisticRegression (is_pvp) + a regressor
    (montage_score) on the `.labels/` records; save to `models/`. Then implement

@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-seed.py — the one-time paid seed (Phase 1).
+seed.py — label candidate windows with a model judge.
 
 Runs the existing high-recall detector to get candidate fight windows, samples
-frames from each, and labels them with Opus (Claude) via the Batches API (−50%
-cost). Every verdict is written to the .labels/ store — the training set for the
-free local student. This is the ONLY step that costs money; everything after is
-local. See DESIGN.md §10.
+frames from each, and labels them, writing every verdict to the .labels/ store —
+the training set for the free local student. Two backends (`--judge`):
 
-This step needs no GPU — it runs wherever the source clips + existing deps live
-(e.g. the Mac). The local VLM and student training (later phases) use the PC.
+  - claude (Phase 1): Opus via the Batches API (−50% cost). The ONLY step that
+    costs money; this is the one-time ~$1 seed. Needs ANTHROPIC_API_KEY, no GPU.
+  - local (Phase 2): the free Qwen2.5-VL-7B teacher via Ollama on the PC (CUDA).
+    Use it to label new clips going forward, and to build the calibration set
+    (re-label the seed windows, then compare with calibrate.py).
+
+See DESIGN.md §10.
 
 Usage:
+    # one-time paid seed (Mac or PC):
     pip install anthropic            # plus the existing requirements + ffmpeg
-    export ANTHROPIC_API_KEY=...     # needed for THIS step only
+    export ANTHROPIC_API_KEY=...     # PowerShell: $env:ANTHROPIC_API_KEY="..."
     python seed.py --in clips --dry-run       # preview windows + cost, no API call
     python seed.py --in clips                 # run the one-time seed (~$1)
     python seed.py --in clips --max-windows 40
+
+    # free local labeling (PC, needs `ollama serve` + `ollama pull qwen2.5vl:7b`):
+    python seed.py --in clips --judge local
 """
 
 import argparse
@@ -28,7 +35,7 @@ import time
 import dnd_montage as dm
 import labels as label_store
 from frames import sample_window
-from judge import ClaudeJudge, SEED_MODEL, WindowContext
+from judge import ClaudeJudge, LocalVLMJudge, SEED_MODEL, WindowContext
 
 FRAMES_PER_WINDOW = 9
 FRAME_WIDTH = 512
@@ -68,35 +75,46 @@ def collect_windows(clips, max_windows=None):
     return jobs[:max_windows] if max_windows else jobs
 
 
-def main():
-    ap = argparse.ArgumentParser(description="One-time Claude seed labeling (Phase 1)")
-    ap.add_argument("--in", dest="in_dir", default="clips")
-    ap.add_argument("--max-windows", type=int, default=None,
-                    help="cap the number of windows sent (bounds spend)")
-    ap.add_argument("--model", default=SEED_MODEL)
-    ap.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
-    ap.add_argument("--frames", type=int, default=FRAMES_PER_WINDOW)
-    ap.add_argument("--dry-run", action="store_true",
-                    help="list windows + cost estimate, sample/call nothing")
-    args = ap.parse_args()
+def _ctx(clip, s, e, dur):
+    return WindowContext(clip=os.path.basename(clip), start=s, end=e,
+                         duration=dur, voice=voice_in_window(clip, s, e))
 
-    clips = find_clips(args.in_dir)
-    if not clips:
-        sys.exit(f"No video files in {args.in_dir} (the seed needs the SOURCE clips).")
 
-    jobs = collect_windows(clips, args.max_windows)
-    if not jobs:
-        sys.exit("No candidate windows found.")
-    print(f"{len(clips)} clip(s), {len(jobs)} candidate window(s).")
-    print(f"Estimated seed cost: ~${len(jobs) * EST_PER_WINDOW:.2f} "
-          f"(Opus via Batches, ~${EST_PER_WINDOW:.4f}/window).")
+def run_local(jobs, args):
+    """Label every window synchronously with the free local Qwen VLM (no cost,
+    no batch API). Writes source='local_vlm' so the trust order in labels.py keeps
+    any existing Claude/human label for the same window."""
+    judge = LocalVLMJudge(model=args.model, host=args.ollama_host)
+    print(f"Labeling locally with {args.model} via Ollama ({args.ollama_host}) ...")
+    ok = err = pvp = 0
+    score_sum = 0.0
+    for i, (clip, (s, e), dur) in enumerate(jobs):
+        name = os.path.basename(clip)
+        frames = sample_window(clip, s, e, n=args.frames, width=FRAME_WIDTH)
+        if not frames:
+            print(f"  ! no frames for {name} [{s:.1f}-{e:.1f}]")
+            err += 1
+            continue
+        try:
+            verdict = judge.score(frames, _ctx(clip, s, e, dur))
+        except Exception as ex:
+            err += 1
+            print(f"  ! {name} [{s:.1f}-{e:.1f}] failed: {ex}")
+            continue
+        label_store.save_verdict(clip, (s, e), len(frames), verdict.to_dict(),
+                                 source="local_vlm")
+        ok += 1
+        pvp += 1 if verdict.is_pvp else 0
+        score_sum += verdict.montage_score
+        print(f"  [{i + 1}/{len(jobs)}] {name} [{s:.1f}-{e:.1f}] "
+              f"pvp={verdict.is_pvp} score={verdict.montage_score} "
+              f"conf={verdict.confidence:.2f}")
+    print(f"\nDone. {ok} labeled, {err} errored. PvP: {pvp}/{ok or 1}. "
+          f"Avg score: {score_sum / max(1, ok):.1f}. Cost: free (local).")
+    print(f"Labels written under {label_store.LABELS_DIR}/.")
 
-    if args.dry_run:
-        for clip, (s, e), _dur in jobs:
-            print(f"  {os.path.basename(clip)}  [{s:.1f}-{e:.1f}]  ({e - s:.0f}s)")
-        print("\nDry run — no frames sampled, no API call.")
-        return
 
+def run_claude(jobs, args):
     judge = ClaudeJudge(model=args.model, effort=args.effort)
 
     print("Sampling frames + building batch ...")
@@ -106,10 +124,8 @@ def main():
         if not frames:
             print(f"  ! no frames for {os.path.basename(clip)} [{s:.1f}-{e:.1f}]")
             continue
-        ctx = WindowContext(clip=os.path.basename(clip), start=s, end=e,
-                            duration=dur, voice=voice_in_window(clip, s, e))
         cid = f"w{i:04d}"
-        requests.append(judge.build_request(cid, frames, ctx))
+        requests.append(judge.build_request(cid, frames, _ctx(clip, s, e, dur)))
         meta[cid] = (clip, (s, e), len(frames))
 
     if not requests:
@@ -162,6 +178,50 @@ def main():
     print(f"Tokens: in={in_full} cache_w={cache_w} cache_r={cache_r} out={out_tok}. "
           f"Actual cost ~= ${cost:.2f}.")
     print(f"Labels written under {label_store.LABELS_DIR}/.")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Label candidate windows with a model judge (Phase 1 seed / Phase 2 local)")
+    ap.add_argument("--in", dest="in_dir", default="clips")
+    ap.add_argument("--judge", choices=["claude", "local"], default="claude",
+                    help="claude = one-time paid Opus seed; local = free Qwen via Ollama")
+    ap.add_argument("--max-windows", type=int, default=None,
+                    help="cap the number of windows labeled (bounds spend on claude)")
+    ap.add_argument("--model", default=None,
+                    help="override the model id (defaults per --judge)")
+    ap.add_argument("--effort", default="medium", choices=["low", "medium", "high"],
+                    help="claude only: reasoning effort")
+    ap.add_argument("--ollama-host", default="http://localhost:11434",
+                    help="local only: Ollama base URL")
+    ap.add_argument("--frames", type=int, default=FRAMES_PER_WINDOW)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="list windows (+ cost for claude), sample/call nothing")
+    args = ap.parse_args()
+    if args.model is None:
+        args.model = SEED_MODEL if args.judge == "claude" else "qwen2.5vl:7b"
+
+    clips = find_clips(args.in_dir)
+    if not clips:
+        sys.exit(f"No video files in {args.in_dir} (labeling needs the SOURCE clips).")
+
+    jobs = collect_windows(clips, args.max_windows)
+    if not jobs:
+        sys.exit("No candidate windows found.")
+    print(f"{len(clips)} clip(s), {len(jobs)} candidate window(s). Judge: {args.judge}.")
+    if args.judge == "claude":
+        print(f"Estimated seed cost: ~${len(jobs) * EST_PER_WINDOW:.2f} "
+              f"(Opus via Batches, ~${EST_PER_WINDOW:.4f}/window).")
+    else:
+        print("Local judge — free (no API cost).")
+
+    if args.dry_run:
+        for clip, (s, e), _dur in jobs:
+            print(f"  {os.path.basename(clip)}  [{s:.1f}-{e:.1f}]  ({e - s:.0f}s)")
+        print("\nDry run — no frames sampled, no model call.")
+        return
+
+    (run_claude if args.judge == "claude" else run_local)(jobs, args)
 
 
 if __name__ == "__main__":

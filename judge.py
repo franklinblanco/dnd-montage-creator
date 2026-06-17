@@ -119,6 +119,29 @@ Be decisive; when the frames are ambiguous, lower the confidence rather than
 inflating the score."""
 
 
+def _window_header(frames, ctx) -> str:
+    """The shared context preamble every backend puts before the frames."""
+    head = (f"Clip: {ctx.clip}\n"
+            f"Window: {ctx.start:.1f}s-{ctx.end:.1f}s of a {ctx.duration:.0f}s clip.\n")
+    if ctx.player_class:
+        head += f"The recording player is a {ctx.player_class}.\n"
+    if ctx.voice.strip():
+        head += f"Player voice during the window: \"{ctx.voice.strip()}\"\n"
+    head += f"{len(frames)} frames follow, in time order."
+    return head
+
+
+def _parse_verdict(text: str) -> Verdict:
+    """Parse a model's JSON output into a validated Verdict. Shared by every
+    backend: structured output enforces most of the schema, but confidence still
+    needs clamping and the category list still needs enum-filtering (a local VLM
+    is looser than the API's constrained decoding)."""
+    v = Verdict.from_dict(json.loads(text))
+    v.confidence = max(0.0, min(1.0, float(v.confidence)))      # schema can't clamp
+    v.categories = [c for c in v.categories if c in CATEGORIES]  # drop anything off-rubric
+    return v
+
+
 class Judge(Protocol):
     """A judge scores one candidate window from its sampled frames."""
     def score(self, frames: list[Frame], ctx: WindowContext) -> Verdict: ...
@@ -134,14 +157,7 @@ class ClaudeJudge:
         self.effort = effort
 
     def _user_content(self, frames, ctx):
-        head = (f"Clip: {ctx.clip}\n"
-                f"Window: {ctx.start:.1f}s-{ctx.end:.1f}s of a {ctx.duration:.0f}s clip.\n")
-        if ctx.player_class:
-            head += f"The recording player is a {ctx.player_class}.\n"
-        if ctx.voice.strip():
-            head += f"Player voice during the window: \"{ctx.voice.strip()}\"\n"
-        head += f"{len(frames)} frames follow, in time order."
-        content = [{"type": "text", "text": head}]
+        content = [{"type": "text", "text": _window_header(frames, ctx)}]
         for fr in frames:
             content.append({"type": "text", "text": f"[t={fr.t:.1f}s]"})
             content.append({"type": "image", "source": {
@@ -180,19 +196,65 @@ class ClaudeJudge:
         text = next((b.text for b in message.content if b.type == "text"), None)
         if not text:
             raise ValueError("no text block in response")
-        v = Verdict.from_dict(json.loads(text))
-        v.confidence = max(0.0, min(1.0, float(v.confidence)))  # schema can't clamp
-        return v
+        return _parse_verdict(text)
 
 
 class LocalVLMJudge:
-    """Free local teacher — Qwen2.5-VL-7B via Ollama on the PC. Phase 2."""
+    """Free local teacher — Qwen2.5-VL-7B via Ollama on the PC. Phase 2.
 
-    def __init__(self, model="qwen2.5vl:7b", host="http://localhost:11434"):
-        self.model, self.host = model, host
+    Talks to Ollama's `/api/chat` over plain HTTP (stdlib only, so this module
+    stays importable without the `ollama` package). Frames go in the user message's
+    `images` list as base64 JPEG; the rubric is the system turn and the per-window
+    context is the user text. The JSON schema is passed as `format`, which recent
+    Ollama uses to constrain the output to a Verdict.
+    """
+
+    def __init__(self, model="qwen2.5vl:7b", host="http://localhost:11434",
+                 timeout=180, num_ctx=16384):
+        self.model, self.host, self.timeout = model, host.rstrip("/"), timeout
+        # 9 512px frames + the rubric run ~10k tokens; Ollama defaults to 4k and
+        # 400s ("exceeds context size") without this. 16k leaves headroom + output.
+        self.num_ctx = num_ctx
+
+    def _payload(self, frames, ctx):
+        ts = ", ".join(f"{fr.t:.1f}s" for fr in frames)
+        prompt = (f"{_window_header(frames, ctx)}\n"
+                  f"The frames are in time order, at: {ts}.\n"
+                  "Return the JSON verdict for this window.")
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": prompt,
+                 "images": [base64.standard_b64encode(fr.jpeg).decode() for fr in frames]},
+            ],
+            "stream": False,
+            "format": output_schema(),
+            "options": {"temperature": 0, "num_ctx": self.num_ctx},  # deterministic; fit the frames
+        }
 
     def score(self, frames, ctx) -> Verdict:
-        raise NotImplementedError("LocalVLMJudge lands in Phase 2 (free local teacher).")
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            f"{self.host}/api/chat",
+            data=json.dumps(self._payload(frames, ctx)).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as ex:
+            detail = ex.read().decode(errors="replace")[:600]
+            raise RuntimeError(f"Ollama {self.model} HTTP {ex.code}: {detail}") from ex
+        except urllib.error.URLError as ex:
+            raise RuntimeError(
+                f"Ollama unreachable at {self.host} ({ex}). Is `ollama serve` running "
+                f"and `ollama pull {self.model}` done?") from ex
+        content = (body.get("message") or {}).get("content", "")
+        if not content:
+            raise ValueError(f"empty response from Ollama model {self.model}: {body}")
+        return _parse_verdict(content)
 
 
 class TrainedHeadJudge:

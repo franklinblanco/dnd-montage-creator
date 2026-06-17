@@ -18,6 +18,9 @@ reports/
 # Cached Whisper transcripts (regenerated from clips on demand)
 .transcripts/
 
+# Cached window preview MP4s for the human review UI (review.py) — regenerated
+.review/
+
 # Model label store (training data) + trained student. Generated, can be large —
 # kept out of git, but .labels/ is your hard-won training asset: back it up and
 # sync it between machines (it's how the Mac<->PC handoff works).

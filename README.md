@@ -63,7 +63,20 @@ python seed.py --in clips              # run the one-time seed (~$1 on a small l
 ```
 
 Needs the **source** clips present (point `--in` at them). Runs on any machine with
-ffmpeg + the requirements — no GPU. The local model and training come in later phases.
+ffmpeg + the requirements — no GPU.
+
+### Free local labeling (Phase 2)
+
+After the paid seed, label new clips for free with a local **Qwen2.5-VL-7B** judge
+via [Ollama](https://ollama.com) (`ollama pull qwen2.5vl:7b`, GPU recommended).
+`calibrate.py` first re-labels the seeded windows locally and reports how closely
+the free teacher agrees with the Opus seed, so you know how much to trust it.
+
+```sh
+ollama serve &                              # if not already running
+python calibrate.py --in clips              # agreement vs the Claude seed
+python seed.py --in clips --judge local     # label (new) clips for free
+```
 
 ## Tuning
 
