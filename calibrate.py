@@ -39,16 +39,26 @@ def _jaccard(a, b):
     return len(sa & sb) / len(sa | sb)
 
 
-def _seeded_records():
-    """[(clip_basename, record)] for every claude-sourced window in the store."""
+def _reference_records(source):
+    """[(clip_basename, record)] for every window whose label came from `source`
+    (the ground truth to score the local teacher against — "human" or "claude")."""
     out = []
     for p in sorted(glob.glob(os.path.join(label_store.LABELS_DIR, "*.json"))):
         with open(p) as fh:
             data = json.load(fh)
         for r in data.get("records", []):
-            if r.get("source") == "claude":
+            if r.get("source") == source:
                 out.append((data["clip"], r))
     return out
+
+
+def _pick_reference():
+    """Prefer human ground truth, fall back to the Claude seed."""
+    if _reference_records("human"):
+        return "human"
+    if _reference_records("claude"):
+        return "claude"
+    return None
 
 
 def _context(clip_path, s, e):
@@ -79,18 +89,23 @@ def main():
     ap.add_argument("--frames", type=int, default=DEFAULT_FRAMES)
     ap.add_argument("--max-windows", type=int, default=None,
                     help="cap windows compared (quick spot-check)")
+    ap.add_argument("--reference", choices=["auto", "human", "claude"], default="auto",
+                    help="ground-truth source to score against (auto: human, else claude)")
     ap.add_argument("--out", default=None, help="write per-window comparison JSON here")
     args = ap.parse_args()
 
-    seeded = _seeded_records()
+    ref = _pick_reference() if args.reference == "auto" else args.reference
+    if ref is None:
+        sys.exit("No human/claude ground-truth labels in .labels/ — label first "
+                 "(python review.py --in <clips>) or run the seed.")
+    seeded = _reference_records(ref)
     if not seeded:
-        sys.exit("No claude-sourced labels in .labels/ — run the seed first "
-                 "(python seed.py --in clips).")
+        sys.exit(f"No '{ref}'-sourced labels in .labels/.")
     if args.max_windows:
         seeded = seeded[:args.max_windows]
 
     judge = LocalVLMJudge(model=args.model, host=args.ollama_host)
-    print(f"Calibrating {args.model} against {len(seeded)} Claude-seeded window(s) ...")
+    print(f"Calibrating {args.model} against {len(seeded)} {ref}-labeled window(s) ...")
 
     rows = []
     tp = fp = fn = tn = 0          # local vs claude-as-truth, on is_pvp
@@ -117,34 +132,35 @@ def main():
             print(f"  ! {clip_name} [{s:.1f}-{e:.1f}] local judge failed: {ex}")
             continue
 
-        ref = Verdict.from_dict(rec["verdict"])
-        # PvP confusion (Claude = ground truth)
-        if ref.is_pvp and local.is_pvp:
+        truth = Verdict.from_dict(rec["verdict"])
+        # PvP confusion (reference = ground truth)
+        if truth.is_pvp and local.is_pvp:
             tp += 1
-        elif not ref.is_pvp and local.is_pvp:
+        elif not truth.is_pvp and local.is_pvp:
             fp += 1
-        elif ref.is_pvp and not local.is_pvp:
+        elif truth.is_pvp and not local.is_pvp:
             fn += 1
         else:
             tn += 1
-        d = abs(local.montage_score - ref.montage_score)
+        d = abs(local.montage_score - truth.montage_score)
         abs_err += d
         exact += 1 if d == 0 else 0
         within1 += 1 if d <= 1 else 0
-        jac = _jaccard(local.categories, ref.categories)
+        jac = _jaccard(local.categories, truth.categories)
         jac_sum += jac
 
         rows.append({
             "clip": clip_name, "window": [s, e],
-            "claude": {"is_pvp": ref.is_pvp, "score": ref.montage_score,
-                       "categories": ref.categories},
+            "reference": {"is_pvp": truth.is_pvp, "score": truth.montage_score,
+                          "categories": truth.categories},
             "local": {"is_pvp": local.is_pvp, "score": local.montage_score,
                       "categories": local.categories, "confidence": local.confidence},
             "score_abs_err": d, "category_jaccard": round(jac, 3),
         })
-        agree = "OK" if ref.is_pvp == local.is_pvp else "XX"
+        agree = "OK" if truth.is_pvp == local.is_pvp else "XX"
         print(f"  [{i + 1}/{len(seeded)}] {agree} {clip_name} [{s:.1f}-{e:.1f}] "
-              f"pvp c={ref.is_pvp}/l={local.is_pvp} score c={ref.montage_score}/l={local.montage_score}")
+              f"pvp ref={truth.is_pvp}/local={local.is_pvp} "
+              f"score ref={truth.montage_score}/local={local.montage_score}")
 
     n = tp + fp + fn + tn
     if not n:
@@ -156,20 +172,20 @@ def main():
     f1 = (2 * prec * rec_ / (prec + rec_)
           if (tp + fp) and (tp + fn) and (prec + rec_) else float("nan"))
 
-    print("\n=== Calibration vs Claude seed ===")
+    print(f"\n=== Calibration vs {ref} labels ===")
     print(f"windows compared : {n}  (missing clips: {missing}, frame/judge fails: {skipped})")
     print(f"is_pvp agreement : {acc:.1%}")
-    print(f"  confusion (Claude=truth): TP={tp} FP={fp} FN={fn} TN={tn}")
+    print(f"  confusion ({ref}=truth): TP={tp} FP={fp} FN={fn} TN={tn}")
     print(f"  local PvP precision={prec:.2f} recall={rec_:.2f} f1={f1:.2f}")
     print(f"montage_score    : MAE={abs_err / n:.2f}  exact={exact / n:.1%}  within±1={within1 / n:.1%}")
     print(f"category overlap : mean Jaccard={jac_sum / n:.2f}")
     print("\nTrust guide: high is_pvp agreement + low score MAE -> the free teacher can "
-          "label new clips at scale. Otherwise keep using the seed / human review on the gap.")
+          "label new clips at scale. Otherwise keep using human review on the gap.")
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         summary = {
-            "model": args.model, "windows": n,
+            "model": args.model, "reference": ref, "windows": n,
             "missing_clips": missing, "failed": skipped,
             "is_pvp_accuracy": acc, "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
             "pvp_precision": prec, "pvp_recall": rec_, "pvp_f1": f1,
