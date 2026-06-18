@@ -21,7 +21,9 @@ Usage:
 """
 
 import argparse
+import array
 import glob
+import hashlib
 import json
 import os
 import re
@@ -40,8 +42,8 @@ from judge import CATEGORIES
 WB_DIR = ".workbench"
 FULL_DIR = os.path.join(WB_DIR, "full")        # remuxed full-clip mp4s (browser-playable)
 WAVE_DIR = os.path.join(WB_DIR, "wave")        # cached waveform peak JSON
-PROJECT = os.path.join(WB_DIR, "project.json")
-KEEP_SCORE = 6                                  # seed cuts from is_pvp windows scoring >= this
+CONFIG = os.path.join(WB_DIR, "config.json")        # remembers the last-used clips folder
+SESSIONS_DIR = os.path.join(WB_DIR, "sessions")     # one project per folder (blank slate for new ones)
 WAVE_BUCKETS = 1600
 VCODEC, CRF, PRESET, ACODEC = "libx264", "18", "veryfast", "aac"
 TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ _-](\d{2})-(\d{2})-(\d{2})")
@@ -96,82 +98,100 @@ def windows_from_labels():
     return out
 
 
-def detect_windows(in_dir):
-    import dnd_montage as dm
-    out = []
-    for clip_path in find_clips(in_dir):
-        try:
-            dur = dm.probe_duration(clip_path)
-        except Exception as ex:
-            print(f"  ! skip {os.path.basename(clip_path)}: {ex}")
-            continue
-        for (s, e, _w, k) in dm.fight_windows(clip_path, dur):
-            out.append((os.path.basename(clip_path), s, e, k))
-    return out
+def _labels_by_clip():
+    """Suggestion windows from the label store, grouped by clip basename. Only
+    shown for clips that actually live in the selected folder."""
+    by = {}
+    for clip, s, e, v in windows_from_labels():
+        by.setdefault(clip, []).append({
+            "start": round(s, 2), "end": round(e, 2),
+            "is_pvp": bool(v and v.get("is_pvp")),
+            "score": int(v.get("montage_score", 0)) if v else 0,
+            "category": (v["categories"][0] if v and v.get("categories") else "")})
+    for ws in by.values():
+        ws.sort(key=lambda w: w["start"])
+    return by
+
+
+def _session_file(in_dir):
+    key = hashlib.md5(os.path.abspath(in_dir).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(SESSIONS_DIR, key + ".json")
 
 
 def build_project(in_dir):
-    """Clips (with suggestion windows) + a seeded cut list."""
-    clips, cuts = {}, []
-    labelled = windows_from_labels()
-    if labelled:
-        source = "labels"
-        for clip, s, e, v in labelled:
-            c = clips.setdefault(clip, {"clip": clip, "duration": 0.0, "windows": []})
-            c["windows"].append({
-                "start": round(s, 2), "end": round(e, 2),
-                "is_pvp": bool(v and v.get("is_pvp")),
-                "score": int(v.get("montage_score", 0)) if v else 0,
-                "category": (v["categories"][0] if v and v.get("categories") else "")})
-        seed = 0
-        for clip, s, e, v in labelled:
-            if v and v.get("is_pvp") and v.get("montage_score", 0) >= KEEP_SCORE:
-                cuts.append({"id": f"seed{seed}", "clip": clip,
-                             "src_in": round(v["tight_start"], 2),
-                             "src_out": round(v["tight_end"], 2),
-                             "category": (v["categories"][0] if v.get("categories") else ""),
-                             "title": ""})
-                seed += 1
-    else:
-        source = "detection"
-        for clip, s, e, k in detect_windows(in_dir):
-            c = clips.setdefault(clip, {"clip": clip, "duration": 0.0, "windows": []})
-            c["windows"].append({"start": round(s, 2), "end": round(e, 2),
-                                 "is_pvp": False, "score": 0,
-                                 "category": "kill_win" if k else ""})
-    for clip, c in clips.items():
-        c["duration"] = round(_duration(os.path.join(in_dir, clip)), 2)
-        c["windows"].sort(key=lambda w: w["start"])
-    clip_list = sorted(clips.values(),
-                       key=lambda c: recording_key(c["clip"], os.path.join(in_dir, c["clip"])))
-    cuts.sort(key=lambda ct: (recording_key(ct["clip"], os.path.join(in_dir, ct["clip"])),
-                              ct["src_in"]))
-    for o, ct in enumerate(cuts):
-        ct["order"] = o
-    return {"clips_dir": in_dir, "fps": 60, "source": source,
-            "clips": clip_list, "cuts": cuts}
+    """A session scoped to ONE folder: clips are the video files IN that folder;
+    cuts start blank. Suggestion windows come from any matching label records."""
+    suggestions = _labels_by_clip()
+    clips = []
+    for path in find_clips(in_dir):
+        name = os.path.basename(path)
+        clips.append({"clip": name, "windows": suggestions.get(name, [])})
+    clips.sort(key=lambda c: recording_key(c["clip"], os.path.join(in_dir, c["clip"])))
+    return {"clips_dir": in_dir, "fps": 60, "clips": clips, "cuts": [],
+            "session_file": _session_file(in_dir)}
 
 
 def load_project(in_dir):
-    """Fresh clips/suggestions every time; keep the user's saved cut list."""
+    """Per-folder session: clips always rebuilt from THIS folder; cuts loaded from
+    this folder's own saved session — so a folder you've never opened is a blank
+    slate, and each folder keeps its own montage."""
     proj = build_project(in_dir)
-    if os.path.exists(PROJECT):
+    sf = proj["session_file"]
+    if os.path.exists(sf):
         try:
-            saved = json.load(open(PROJECT))
-            if isinstance(saved.get("cuts"), list):
-                proj["cuts"] = saved["cuts"]
+            proj["cuts"] = json.load(open(sf)).get("cuts", [])
         except Exception:
             pass
     return proj
 
 
 def save_project(proj):
-    os.makedirs(WB_DIR, exist_ok=True)
-    json.dump(proj, open(PROJECT, "w"), indent=2)
+    sf = proj["session_file"]
+    os.makedirs(os.path.dirname(sf), exist_ok=True)
+    json.dump({"clips_dir": proj["clips_dir"], "cuts": proj["cuts"]},
+              open(sf, "w"), indent=2)
 
 
 def _clip_path(proj, clip):
     return os.path.join(proj["clips_dir"], clip)
+
+
+def _safe_filename(name):
+    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip().strip(".")
+    return name or "clip"
+
+
+def rename_clip(proj, clip, new_name):
+    """Rename a source clip file on disk and update the clips list + any cuts that
+    reference it. Keeps the original extension. Returns the new basename."""
+    src = _clip_path(proj, clip)
+    if not os.path.exists(src):
+        raise RuntimeError("clip file not found")
+    ext = os.path.splitext(clip)[1]
+    stem = new_name.strip()
+    if stem.lower().endswith(ext.lower()):
+        stem = stem[:-len(ext)]
+    new = _safe_filename(stem) + ext
+    if new == clip:
+        return clip
+    dst = os.path.join(proj["clips_dir"], new)
+    if os.path.exists(dst):
+        raise RuntimeError(f"a file named {new} already exists")
+    os.rename(src, dst)
+    for c in proj["clips"]:
+        if c["clip"] == clip:
+            c["clip"] = new
+    for ct in proj["cuts"]:
+        if ct.get("clip") == clip:
+            ct["clip"] = new
+    save_project(proj)
+    return new
+
+
+def _clip_key(path):
+    """Cache key by absolute path, so same-named clips in different folders don't
+    collide (and caches are shared across sessions for the same file)."""
+    return hashlib.md5(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
 
 
 # ---- media ----------------------------------------------------------------
@@ -191,7 +211,7 @@ def _ensure_dir(path):
 def remux_full(clip_path):
     """Lossless stream-copy to a browser-playable mp4 (Chrome won't play mkv)."""
     os.makedirs(FULL_DIR, exist_ok=True)
-    out = os.path.join(FULL_DIR, _safe(os.path.basename(clip_path)) + ".mp4")
+    out = os.path.join(FULL_DIR, _clip_key(clip_path) + ".mp4")
     if os.path.exists(out) and os.path.getsize(out) > 0:
         return out
     try:
@@ -206,19 +226,24 @@ def remux_full(clip_path):
 def waveform_data(clip_path, buckets=WAVE_BUCKETS):
     """Cached peak-envelope (0..1) of the audio, for drawing action spikes."""
     os.makedirs(WAVE_DIR, exist_ok=True)
-    cache = os.path.join(WAVE_DIR, _safe(os.path.basename(clip_path)) + ".json")
+    cache = os.path.join(WAVE_DIR, _clip_key(clip_path) + ".json")
     if os.path.exists(cache):
         return json.load(open(cache))
-    import numpy as np
     raw = subprocess.run(["ffmpeg", "-i", clip_path, "-ac", "1", "-ar", "8000",
                           "-f", "s16le", "-v", "quiet", "-"], capture_output=True).stdout
-    a = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    if len(a) == 0:
+    # stdlib only (no numpy): interpret as int16 PCM, take max-abs per bucket.
+    pcm = array.array("h")
+    pcm.frombytes(raw[:len(raw) // 2 * 2])
+    n = len(pcm)
+    if n == 0:
         peaks = [0.0] * buckets
     else:
-        idx = np.linspace(0, len(a), buckets + 1).astype(int)
-        peaks = [float(np.abs(a[idx[i]:idx[i + 1]]).max()) if idx[i + 1] > idx[i] else 0.0
-                 for i in range(buckets)]
+        peaks = [0.0] * buckets
+        for i in range(buckets):
+            lo, hi = i * n // buckets, (i + 1) * n // buckets
+            if hi > lo:
+                seg = pcm[lo:hi]
+                peaks[i] = max(max(seg), -min(seg))
         m = max(peaks) or 1.0
         peaks = [round(p / m, 3) for p in peaks]
     data = {"peaks": peaks}
@@ -457,6 +482,10 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>Clip workbenc
 <div class="clipbar" id="clipbar"></div>
 <div class="main">
  <div class="left">
+   <div class="ctl" style="margin-bottom:6px">
+     <b id="curname" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%">—</b>
+     <button id="renameBtn">✎ Rename clip file</button>
+   </div>
    <video id="player" controls preload="auto"></video>
    <canvas id="wave"></canvas>
    <div class="ctl">
@@ -501,10 +530,24 @@ function renderClipbar(){
 }
 async function loadClip(clip){
   cur=clip; renderClipbar();
+  document.getElementById('curname').textContent=clip;
   player.src='/full?clip='+enc(clip);
   wave=await (await fetch('/wave?clip='+enc(clip))).json();
   sel=null; document.getElementById('seldur').textContent=''; drawWave();
 }
+document.getElementById('renameBtn').onclick=async()=>{
+  if(!cur){return;}
+  const nn=prompt("Rename this clip file (extension kept):", cur);
+  if(!nn || nn===cur) return;
+  const r=await fetch('/rename',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({clip:cur,new_name:nn})});
+  const j=await r.json();
+  statusEl.textContent=j.msg||'';
+  if(!j.ok) return;
+  CLIPS.forEach(c=>{if(c.clip===cur)c.clip=j.clip;});
+  cuts.forEach(c=>{if(c.clip===cur)c.clip=j.clip;});
+  renderCuts(); loadClip(j.clip);   // reload under the new name
+};
 function T2X(t){return wave?t/wave.duration*cv.width:0;}
 function X2T(x){return wave?x/cv.width*wave.duration:0;}
 function drawWave(){
@@ -658,8 +701,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, PAGE.replace("__CATS__", json.dumps(CATEGORIES)),
                               "text/html; charset=utf-8")
         if u.path == "/clips":
-            return self._send(200, [{"clip": c["clip"], "duration": c["duration"],
-                                     "n_windows": len(c["windows"])} for c in self.proj["clips"]])
+            return self._send(200, [{"clip": c["clip"], "n_windows": len(c["windows"])}
+                                    for c in self.proj["clips"]])
         if u.path == "/cuts":
             return self._send(200, self.proj["cuts"])
         if u.path == "/wave":
@@ -667,8 +710,9 @@ class Handler(BaseHTTPRequestHandler):
             if not clip:
                 return self._send(404, {"error": "unknown clip"})
             c = next(x for x in self.proj["clips"] if x["clip"] == clip)
-            wf = waveform_data(_clip_path(self.proj, clip))
-            return self._send(200, {"duration": c["duration"], "peaks": wf["peaks"],
+            path = _clip_path(self.proj, clip)
+            wf = waveform_data(path)
+            return self._send(200, {"duration": _duration(path), "peaks": wf["peaks"],
                                     "windows": c["windows"]})
         if u.path == "/full":
             clip = self._clip_arg()
@@ -691,9 +735,25 @@ class Handler(BaseHTTPRequestHandler):
         self.proj["cuts"] = clean
         save_project(self.proj)
 
+    def _do_rename(self):
+        n = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(n).decode()) if n else {}
+        clip, new = body.get("clip"), (body.get("new_name") or "").strip()
+        if clip not in {c["clip"] for c in self.proj["clips"]}:
+            return self._send(200, {"ok": False, "msg": "unknown clip"})
+        if not new:
+            return self._send(200, {"ok": False, "msg": "empty name"})
+        try:
+            newname = rename_clip(self.proj, clip, new)
+            self._send(200, {"ok": True, "clip": newname, "msg": f"renamed to {newname}"})
+        except Exception as ex:
+            self._send(200, {"ok": False, "msg": f"error: {ex}"})
+
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path == "/rename":
+                return self._do_rename()
             self._set_cuts()
             if path == "/cuts":
                 return self._send(200, {"ok": True, "msg": "saved"})
@@ -713,24 +773,69 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": False, "msg": f"error: {ex}"})
 
 
+def _last_dir():
+    try:
+        return json.load(open(CONFIG)).get("last_dir")
+    except Exception:
+        return None
+
+
+def _remember_dir(d):
+    os.makedirs(WB_DIR, exist_ok=True)
+    json.dump({"last_dir": d}, open(CONFIG, "w"))
+
+
+def pick_folder(default=None):
+    """Native OS 'Select Folder' dialog. Returns the chosen path, or None if the
+    dialog is cancelled or unavailable (then the caller falls back to --in)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askdirectory(
+            title="Select your Dark and Darker clips folder",
+            initialdir=default or os.path.expanduser("~"), mustexist=True)
+        root.destroy()
+        return chosen or None
+    except Exception as ex:
+        print(f"  ! folder picker unavailable ({ex}); pass --in <clips-dir> instead.")
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Fast clip workbench (full clips + waveform + cuts)")
-    ap.add_argument("--in", dest="in_dir", default="clips", help="folder with the SOURCE clips")
+    ap.add_argument("--in", dest="in_dir", default=None,
+                    help="folder with the SOURCE clips (omit to pick one on start)")
     ap.add_argument("--out", default="montage", help="output folder for exports")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--intro", default=None)
     ap.add_argument("--outro", default=None)
     ap.add_argument("--music", default=None)
-    ap.add_argument("--rebuild", action="store_true", help="rebuild clips/suggestions (keeps saved cuts)")
+    ap.add_argument("--rebuild", action="store_true", help="discard this folder's saved cuts (blank slate)")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
 
-    proj = load_project(args.in_dir)
+    in_dir = args.in_dir
+    if not in_dir:
+        print("Pick your clips folder in the dialog… (or pass --in <dir> to skip)")
+        in_dir = pick_folder(_last_dir())
+        if not in_dir:
+            sys.exit("No folder selected. Re-run and choose a folder, or pass --in <clips-dir>.")
+    if not os.path.isdir(in_dir):
+        sys.exit(f"Not a folder: {in_dir}")
+    _remember_dir(in_dir)
+    print(f"Working folder: {in_dir}")
+
+    if args.rebuild and os.path.exists(_session_file(in_dir)):
+        os.remove(_session_file(in_dir))
+    proj = load_project(in_dir)
     if not proj["clips"]:
-        sys.exit("No clips with detected windows. Run detection/labeling first, or check --in.")
+        sys.exit(f"No video clips found in {in_dir}.")
     save_project(proj)
-    print(f"Project: {len(proj['clips'])} clip(s), {len(proj['cuts'])} seeded cut(s) "
-          f"(from {proj.get('source')}). Full clips + waveforms load on demand.")
+    print(f"Project: {len(proj['clips'])} clip(s) in this folder, "
+          f"{len(proj['cuts'])} cut(s) in its session. Full clips + waveforms load on demand.")
 
     Handler.proj = proj
     Handler.out_dir = args.out
@@ -748,7 +853,7 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         save_project(proj)
-        print("\nStopped. Project saved to", PROJECT)
+        print("\nStopped. Session saved to", proj["session_file"])
 
 
 if __name__ == "__main__":
